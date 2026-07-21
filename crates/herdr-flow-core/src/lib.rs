@@ -14,6 +14,7 @@ mod artifact;
 pub mod canonical_json;
 mod digest;
 mod envelope;
+mod git;
 mod id;
 mod pipeline;
 mod stage;
@@ -26,6 +27,7 @@ pub use envelope::{
     ArtifactReference, AuthenticatedAgentContext, Envelope, EnvelopeParseError,
     EnvelopeValidationError, MessageKind, SubmissionAuthority,
 };
+pub use git::{GitObjectFormat, GitObjectId, GitObjectIdError};
 pub use id::{
     ArtifactId, BatchId, EventId, IdentifierError, MessageId, ParticipantPrincipalId,
     RoleBindingId, RunId, StageInstanceId,

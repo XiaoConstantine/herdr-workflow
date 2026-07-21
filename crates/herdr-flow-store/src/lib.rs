@@ -3,10 +3,12 @@
 //! Atomic persistence adapters for Herdr Flow.
 
 mod artifact;
+mod git;
 mod pipeline;
 mod registry;
 
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
+pub use git::{GitRepository, GitRepositoryError, SnapshotRefOutcome};
 pub use pipeline::{
     SemanticBatch, SemanticCommitOutcome, SemanticPipelineEntry, SemanticStageEntry,
 };
