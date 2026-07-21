@@ -14,6 +14,7 @@ repository = "https://github.com/XiaoConstantine/herdr-workflow"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 ryu-js = "1.0"
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }

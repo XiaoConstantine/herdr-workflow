@@ -2,6 +2,10 @@
 
 //! Atomic persistence adapters for Herdr Flow.
 
+mod artifact;
+
+pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
+
 use std::{fmt, path::Path, str::FromStr, time::Duration};
 
 use herdr_flow_core::{

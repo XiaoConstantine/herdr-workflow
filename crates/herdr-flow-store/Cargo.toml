@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 herdr-flow-core = { path = "../herdr-flow-core" }
+libc.workspace = true
 rusqlite.workspace = true
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true, features = ["std"] }

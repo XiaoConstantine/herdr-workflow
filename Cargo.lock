@@ -271,6 +271,7 @@ name = "herdr-flow-store"
 version = "0.1.0"
 dependencies = [
  "herdr-flow-core",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
