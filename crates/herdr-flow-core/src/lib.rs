@@ -14,6 +14,7 @@ pub mod canonical_json;
 mod digest;
 mod envelope;
 mod id;
+mod stage;
 
 pub use digest::{DigestParseError, Sha256Digest};
 pub use envelope::{
@@ -23,6 +24,10 @@ pub use envelope::{
 pub use id::{
     ArtifactId, IdentifierError, MessageId, ParticipantPrincipalId, RoleBindingId, RunId,
     StageInstanceId,
+};
+pub use stage::{
+    replay_stage, StageCommand, StageEvent, StageEventKind, StagePhase, StageState,
+    StageTransitionError,
 };
 
 /// The base protocol implemented by this runtime.
