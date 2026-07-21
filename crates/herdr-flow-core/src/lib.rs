@@ -8,6 +8,23 @@
 //! network, terminal, Git, clock, process, and random-number APIs. CI also
 //! allowlists its direct dependencies.
 
+extern crate alloc;
+
+pub mod canonical_json;
+mod digest;
+mod envelope;
+mod id;
+
+pub use digest::{DigestParseError, Sha256Digest};
+pub use envelope::{
+    ArtifactReference, AuthenticatedAgentContext, Envelope, EnvelopeParseError,
+    EnvelopeValidationError, MessageKind, SubmissionAuthority,
+};
+pub use id::{
+    ArtifactId, IdentifierError, MessageId, ParticipantPrincipalId, RoleBindingId, RunId,
+    StageInstanceId,
+};
+
 /// The base protocol implemented by this runtime.
 pub const BASE_PROTOCOL: &str = "herdr.flow/v1";
 

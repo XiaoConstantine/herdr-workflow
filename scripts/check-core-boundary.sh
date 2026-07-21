@@ -19,7 +19,10 @@ actual_dependencies=$(
     | sed -E 's/ v[0-9].*$//' \
     | LC_ALL=C sort -u
 )
-expected_dependencies='serde'
+expected_dependencies='ryu-js
+serde
+serde_json
+sha2'
 
 if [[ "$actual_dependencies" != "$expected_dependencies" ]]; then
   echo "herdr-flow-core direct dependencies changed." >&2
