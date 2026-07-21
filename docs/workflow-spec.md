@@ -1012,17 +1012,30 @@ State lives outside checkouts:
 
 ```text
 ~/.local/state/herdr-flow/runs/<run-id>/
-  run.json
-  events.jsonl
-  outbox.jsonl
+  run.sqlite3
   artifacts/
   checks/
+  exports/
+    events.jsonl
+    outbox.jsonl
 ```
 
-The event log plus reconciled outbox is authoritative under the selected threat
-model. One coordinator holds a renewable run lease and reducer lock. Event
-acceptance, snapshot updates, and external effects follow append/fsync and
-intent-before-effect/result-after-effect ordering.
+The SQLite event journal plus reconciled outbox is authoritative under the
+selected threat model. JSONL files are derived audit/interchange exports and are
+never recovery inputs. One coordinator holds a renewable run lease and reducer
+lock.
+
+The store enables WAL mode, foreign-key enforcement, and `synchronous=FULL` on
+every connection. Event acceptance, compare-and-swap revisions, snapshot updates,
+lease changes, and side-effect intents commit in one SQLite transaction. The
+outbox follows intent-before-effect/result-after-effect ordering; no external
+effect runs while a database transaction is open.
+
+Artifact bytes become durable before any committed event may reference them. The
+store writes a temporary file on the artifact filesystem, verifies its size and
+digest, fsyncs it, atomically renames it to the digest path, and fsyncs the parent
+directory before inserting the artifact record and accepting its event. Recovery
+rejects a database artifact record whose bytes are absent or fail verification.
 
 Version domains are separated:
 

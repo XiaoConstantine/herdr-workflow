@@ -1,0 +1,10 @@
+[package]
+name = "herdr-flow-core"
+description = "Pure domain types and deterministic workflow logic for Herdr Flow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true

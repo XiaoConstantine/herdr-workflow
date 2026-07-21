@@ -1,0 +1,16 @@
+[package]
+name = "herdr-flow-cli"
+description = "Command-line coordinator for Herdr Flow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "herdr-flow"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+herdr-flow-core = { path = "../herdr-flow-core" }
+herdr-flow-store = { path = "../herdr-flow-store" }

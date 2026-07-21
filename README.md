@@ -4,7 +4,7 @@ Herdr is a composable, event-sourced workflow framework for coordinating indepen
 
 The framework keeps authority in a deterministic runtime: agents propose authenticated reports about exact immutable artifacts, while committed events and reducers advance workflow state. Publication always requires explicit human authorization.
 
-> **Status:** Draft v0.7 — design and architecture phase.
+> **Status:** Draft v0.7 — M1 runtime implementation in progress.
 
 ![Herdr workflow architecture](docs/architecture.png)
 
@@ -34,10 +34,15 @@ The editable canvas has two pages:
 ## Repository layout
 
 ```text
+crates/
+  herdr-flow-core/      Pure protocol and reducer logic
+  herdr-flow-store/     Persistence adapters
+  herdr-flow-cli/       Coordinator executable
 docs/
-  workflow-spec.md      Normative Draft v0.7 specification
+  workflow-spec.md      Draft v0.7 specification
   architecture.tldraw  Editable architecture and detailed workflow
   architecture.png     Rendered architecture preview
+  decisions/            Architecture decision records
 examples/
   README.md             Planned workflow examples
 ```
@@ -46,9 +51,20 @@ examples/
 
 Open `docs/architecture.tldraw` in [tldraw](https://www.tldraw.com/) or tldraw offline. Use **Architecture · Start Here** for the overview and **Detailed Workflow** for the full graph.
 
+## Development
+
+The Rust version is pinned in `rust-toolchain.toml`. After installing [rustup](https://rustup.rs/), run:
+
+```bash
+just check
+cargo run -p herdr-flow-cli -- --version
+```
+
+`just check` runs formatting checks, Clippy with warnings denied, and all workspace tests.
+
 ## Scope
 
-This repository currently defines the framework and architecture. Runtime code, provider adapters, schemas, conformance fixtures, and reference workflows will be added as the design progresses.
+Implementation begins with the M1 deterministic runtime kernel and static adversarial-review pipeline. Provider adapters, schemas, conformance fixtures, and reference workflows will be added incrementally after the core boundaries are proven.
 
 ## License
 

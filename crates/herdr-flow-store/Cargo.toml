@@ -1,0 +1,10 @@
+[package]
+name = "herdr-flow-store"
+description = "Persistence adapters for Herdr Flow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+herdr-flow-core = { path = "../herdr-flow-core" }
