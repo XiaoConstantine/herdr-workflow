@@ -32,10 +32,10 @@ pub(crate) struct ArtifactCommitment {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedArtifact {
-    record: ArtifactRecord,
-    parent_artifact_ids: Vec<ArtifactId>,
-    record_json: Vec<u8>,
-    record_digest: Sha256Digest,
+    pub(crate) record: ArtifactRecord,
+    pub(crate) parent_artifact_ids: Vec<ArtifactId>,
+    pub(crate) record_json: Vec<u8>,
+    pub(crate) record_digest: Sha256Digest,
 }
 
 pub(crate) fn prepare_artifacts(

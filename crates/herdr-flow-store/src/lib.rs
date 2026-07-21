@@ -7,6 +7,9 @@ mod pipeline;
 mod registry;
 
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
+pub use pipeline::{
+    SemanticBatch, SemanticCommitOutcome, SemanticPipelineEntry, SemanticStageEntry,
+};
 pub use registry::{ArtifactRegistration, StoredArtifactRecord};
 
 use std::{fmt, path::Path, str::FromStr, time::Duration};
@@ -109,6 +112,11 @@ pub enum StoreError {
     PipelineSnapshotMismatch,
     PipelineRootConflict,
     PipelineStageRegistrationRequired,
+    EmptySemanticBatch,
+    PipelineStageMismatch,
+    PartialSemanticBatch,
+    PipelineSemanticCommitRequired,
+    SemanticBatchConflict,
 }
 
 impl SqliteStore {
@@ -180,6 +188,16 @@ impl SqliteStore {
 
                 CREATE INDEX IF NOT EXISTS pipeline_events_run_sequence
                     ON pipeline_events(run_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS semantic_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    batch_digest TEXT NOT NULL,
+                    batch_json BLOB NOT NULL
+                ) STRICT;
+
+                CREATE INDEX IF NOT EXISTS semantic_batches_run_id
+                    ON semantic_batches(run_id, batch_id);
 
                 CREATE TABLE IF NOT EXISTS events (
                     event_id TEXT PRIMARY KEY,
@@ -347,6 +365,9 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
 
         verify_run_journal(&transaction, request.run_id)?;
+        if pipeline::pipeline_snapshot_exists(&transaction, request.run_id)? {
+            return Err(StoreError::PipelineSemanticCommitRequired);
+        }
 
         if pipeline::pipeline_message_id_exists(&transaction, request.message_id)? {
             return Err(StoreError::MessageIdConflict);
@@ -546,6 +567,23 @@ impl SqliteStore {
         let events = load_events(&transaction, run_id, stage_instance_id)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(events)
+    }
+
+    pub fn next_event_sequence(&self, run_id: &RunId) -> Result<u64, StoreError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(StoreError::Sqlite)?;
+        verify_run_journal(&transaction, run_id)?;
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT next_event_sequence FROM runs WHERE run_id = ?1",
+                params![run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        from_sql_integer(sequence)
     }
 
     pub fn event_count(&self, run_id: &RunId) -> Result<u64, StoreError> {
@@ -874,7 +912,7 @@ fn decode_event_row(row: RawEventRow) -> Result<StoredStageEvent, StoreError> {
 }
 
 fn event_by_message_id(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     message_id: &MessageId,
 ) -> Result<Option<StoredStageEvent>, StoreError> {
     let row = transaction
@@ -974,6 +1012,19 @@ impl fmt::Display for StoreError {
             }
             Self::PipelineStageRegistrationRequired => {
                 formatter.write_str("stages in a registered pipeline require unified registration")
+            }
+            Self::EmptySemanticBatch => formatter.write_str("semantic batch has no pipeline event"),
+            Self::PipelineStageMismatch => {
+                formatter.write_str("pipeline and stage effects do not match")
+            }
+            Self::PartialSemanticBatch => {
+                formatter.write_str("semantic batch was only partially committed")
+            }
+            Self::PipelineSemanticCommitRequired => {
+                formatter.write_str("registered pipeline runs require a unified semantic commit")
+            }
+            Self::SemanticBatchConflict => {
+                formatter.write_str("semantic batch ID was reused with different content")
             }
         }
     }

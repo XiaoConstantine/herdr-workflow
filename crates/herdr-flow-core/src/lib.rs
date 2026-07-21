@@ -27,8 +27,8 @@ pub use envelope::{
     EnvelopeValidationError, MessageKind, SubmissionAuthority,
 };
 pub use id::{
-    ArtifactId, EventId, IdentifierError, MessageId, ParticipantPrincipalId, RoleBindingId, RunId,
-    StageInstanceId,
+    ArtifactId, BatchId, EventId, IdentifierError, MessageId, ParticipantPrincipalId,
+    RoleBindingId, RunId, StageInstanceId,
 };
 pub use pipeline::{
     replay_pipeline, InputManifestArtifact, PipelineCommand, PipelineDefinitionError,
