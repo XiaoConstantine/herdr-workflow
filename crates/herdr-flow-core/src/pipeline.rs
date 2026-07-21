@@ -12,7 +12,7 @@ use crate::{
     StagePhase, StageState, StageTransitionError, BASE_PROTOCOL, MAX_CONTROL_REVISION,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PipelineNodeDefinition {
     pub stage: StageState,
     pub needs: Vec<StageInstanceId>,
@@ -84,20 +84,20 @@ impl StageInputManifest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PipelineArtifact {
     sha256: Sha256Digest,
     parents: Vec<ArtifactId>,
     valid: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PendingInvalidation {
     cause_digest: Sha256Digest,
     reconciliation_stage_ids: Vec<StageInstanceId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PipelineState {
     pub definition_digest: Sha256Digest,
     pub control_revision: u64,
@@ -235,6 +235,19 @@ impl PipelineState {
             invalidated_stages: BTreeSet::new(),
             pending_invalidations: BTreeMap::new(),
         })
+    }
+
+    pub fn is_pristine(&self) -> bool {
+        if self.control_revision != 0
+            || !self.artifacts.is_empty()
+            || !self.frozen_stages.is_empty()
+            || !self.invalidated_stages.is_empty()
+            || !self.pending_invalidations.is_empty()
+        {
+            return false;
+        }
+        let definitions = self.nodes.values().cloned().collect();
+        Self::new(self.definition_digest, definitions).is_ok_and(|initial| initial == *self)
     }
 
     pub fn stage(&self, stage_instance_id: &StageInstanceId) -> Option<&StageState> {

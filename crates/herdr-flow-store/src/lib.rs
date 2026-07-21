@@ -3,6 +3,7 @@
 //! Atomic persistence adapters for Herdr Flow.
 
 mod artifact;
+mod pipeline;
 mod registry;
 
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
@@ -12,9 +13,9 @@ use std::{fmt, path::Path, str::FromStr, time::Duration};
 
 use herdr_flow_core::{
     canonical_json, replay_stage, ArtifactCatalog, ArtifactCatalogError, ArtifactId,
-    ArtifactRecordValidationError, EventId, IdentifierError, MessageId, RunId, Sha256Digest,
-    StageEvent, StageInstanceId, StageState, StageTransitionError, BASE_PROTOCOL,
-    MAX_CONTROL_REVISION,
+    ArtifactRecordValidationError, EventId, IdentifierError, MessageId, PipelineTransitionError,
+    RunId, Sha256Digest, StageEvent, StageInstanceId, StageState, StageTransitionError,
+    BASE_PROTOCOL, MAX_CONTROL_REVISION,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,14 @@ pub enum StoreError {
     ArtifactNotFound,
     ArtifactRunMismatch,
     ArtifactReferenceNotFound,
+    PipelineTransition(PipelineTransitionError),
+    PipelineAlreadyExists,
+    InvalidInitialPipeline,
+    PipelineNotFound,
+    PipelineDefinitionMismatch,
+    PipelineSnapshotMismatch,
+    PipelineRootConflict,
+    PipelineStageRegistrationRequired,
 }
 
 impl SqliteStore {
@@ -146,6 +155,31 @@ impl SqliteStore {
 
                 CREATE INDEX IF NOT EXISTS stage_snapshots_run_id
                     ON stage_snapshots(run_id);
+
+                CREATE TABLE IF NOT EXISTS pipeline_snapshots (
+                    run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    control_revision INTEGER NOT NULL
+                        CHECK(control_revision >= 0 AND control_revision <= 9007199254740991),
+                    initial_state_json BLOB NOT NULL,
+                    state_json BLOB NOT NULL
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS pipeline_events (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    sequence INTEGER NOT NULL
+                        CHECK(sequence >= 1 AND sequence <= 9007199254740991),
+                    message_id TEXT NOT NULL UNIQUE,
+                    message_digest TEXT NOT NULL,
+                    prior_control_revision INTEGER NOT NULL
+                        CHECK(prior_control_revision >= 0 AND prior_control_revision <= 9007199254740991),
+                    event_digest TEXT NOT NULL,
+                    event_json BLOB NOT NULL,
+                    UNIQUE(run_id, sequence)
+                ) STRICT;
+
+                CREATE INDEX IF NOT EXISTS pipeline_events_run_sequence
+                    ON pipeline_events(run_id, sequence);
 
                 CREATE TABLE IF NOT EXISTS events (
                     event_id TEXT PRIMARY KEY,
@@ -249,6 +283,9 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
         require_run(&transaction, run_id)?;
+        if pipeline::pipeline_snapshot_exists(&transaction, run_id)? {
+            return Err(StoreError::PipelineStageRegistrationRequired);
+        }
         let state_json = serde_json::to_vec(state).map_err(StoreError::Serialization)?;
         let inserted = transaction
             .execute(
@@ -311,6 +348,9 @@ impl SqliteStore {
 
         verify_run_journal(&transaction, request.run_id)?;
 
+        if pipeline::pipeline_message_id_exists(&transaction, request.message_id)? {
+            return Err(StoreError::MessageIdConflict);
+        }
         if let Some(existing) = event_by_message_id(&transaction, request.message_id)? {
             if existing.run_id == *request.run_id
                 && existing.message_digest == *request.message_digest
@@ -696,13 +736,11 @@ fn verify_run_journal(connection: &Connection, run_id: &RunId) -> Result<(), Sto
     let rows = statement
         .query_map(params![run_id.as_str()], raw_event_row)
         .map_err(StoreError::Sqlite)?;
-    let mut expected_sequence = INITIAL_EVENT_SEQUENCE;
+    let mut sequences = Vec::new();
     for row in rows {
         let stored = decode_event_row(row.map_err(StoreError::Sqlite)?)?;
-        if stored.run_id != *run_id || stored.sequence != expected_sequence {
-            return Err(StoreError::CorruptData(
-                "run event sequence is not contiguous",
-            ));
+        if stored.run_id != *run_id {
+            return Err(StoreError::CorruptData("event belongs to another run"));
         }
         registry::verify_committed_artifacts(
             connection,
@@ -711,6 +749,35 @@ fn verify_run_journal(connection: &Connection, run_id: &RunId) -> Result<(), Sto
             &stored.event.stage_instance_id,
             &stored.artifact_commitments,
         )?;
+        sequences.push(stored.sequence);
+    }
+    drop(statement);
+    sequences.extend(pipeline::verify_pipeline_journal(connection, run_id)?);
+    let (entry_count, distinct_event_ids, distinct_message_ids): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT event_id), COUNT(DISTINCT message_id)
+             FROM (
+                SELECT event_id, message_id FROM events WHERE run_id = ?1
+                UNION ALL
+                SELECT event_id, message_id FROM pipeline_events WHERE run_id = ?1
+             )",
+            params![run_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(StoreError::Sqlite)?;
+    if entry_count != distinct_event_ids || entry_count != distinct_message_ids {
+        return Err(StoreError::CorruptData(
+            "run journal contains duplicate event or message IDs",
+        ));
+    }
+    sequences.sort_unstable();
+    let mut expected_sequence = INITIAL_EVENT_SEQUENCE;
+    for sequence in sequences {
+        if sequence != expected_sequence {
+            return Err(StoreError::CorruptData(
+                "run event sequence is not contiguous",
+            ));
+        }
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or(StoreError::EventSequenceExhausted)?;
@@ -826,7 +893,11 @@ fn event_by_message_id(
 fn event_id_exists(transaction: &Transaction<'_>, event_id: &EventId) -> Result<bool, StoreError> {
     transaction
         .query_row(
-            "SELECT 1 FROM events WHERE event_id = ?1",
+            "SELECT 1 FROM (
+                SELECT event_id FROM events WHERE event_id = ?1
+                UNION ALL
+                SELECT event_id FROM pipeline_events WHERE event_id = ?1
+             ) LIMIT 1",
             params![event_id.as_str()],
             |_| Ok(true),
         )
@@ -885,6 +956,24 @@ impl fmt::Display for StoreError {
             Self::ArtifactRunMismatch => formatter.write_str("artifact belongs to another run"),
             Self::ArtifactReferenceNotFound => {
                 formatter.write_str("event references an unregistered artifact digest")
+            }
+            Self::PipelineTransition(error) => error.fmt(formatter),
+            Self::PipelineAlreadyExists => formatter.write_str("pipeline already exists"),
+            Self::InvalidInitialPipeline => {
+                formatter.write_str("pipeline bootstrap state is not pristine")
+            }
+            Self::PipelineNotFound => formatter.write_str("pipeline does not exist"),
+            Self::PipelineDefinitionMismatch => {
+                formatter.write_str("pipeline definition digest does not match the run")
+            }
+            Self::PipelineSnapshotMismatch => {
+                formatter.write_str("pipeline snapshot does not match deterministic replay")
+            }
+            Self::PipelineRootConflict => {
+                formatter.write_str("pipeline cannot be registered after stage roots")
+            }
+            Self::PipelineStageRegistrationRequired => {
+                formatter.write_str("stages in a registered pipeline require unified registration")
             }
         }
     }
