@@ -15,6 +15,7 @@ pub mod canonical_json;
 mod digest;
 mod envelope;
 mod id;
+mod pipeline;
 mod stage;
 
 pub use artifact::{
@@ -28,6 +29,11 @@ pub use envelope::{
 pub use id::{
     ArtifactId, EventId, IdentifierError, MessageId, ParticipantPrincipalId, RoleBindingId, RunId,
     StageInstanceId,
+};
+pub use pipeline::{
+    replay_pipeline, InputManifestArtifact, PipelineCommand, PipelineDefinitionError,
+    PipelineEvent, PipelineEventKind, PipelineNodeDefinition, PipelineState,
+    PipelineTransitionError, StageInputManifest,
 };
 pub use stage::{
     replay_stage, StageCommand, StageEvent, StageEventKind, StagePhase, StageState,
