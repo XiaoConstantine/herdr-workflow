@@ -22,12 +22,12 @@ pub use envelope::{
     EnvelopeValidationError, MessageKind, SubmissionAuthority,
 };
 pub use id::{
-    ArtifactId, IdentifierError, MessageId, ParticipantPrincipalId, RoleBindingId, RunId,
+    ArtifactId, EventId, IdentifierError, MessageId, ParticipantPrincipalId, RoleBindingId, RunId,
     StageInstanceId,
 };
 pub use stage::{
     replay_stage, StageCommand, StageEvent, StageEventKind, StagePhase, StageState,
-    StageTransitionError,
+    StageTransitionError, MAX_CONTROL_REVISION,
 };
 
 /// The base protocol implemented by this runtime.

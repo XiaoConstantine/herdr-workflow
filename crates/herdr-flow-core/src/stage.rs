@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Sha256Digest, StageInstanceId};
 
+/// Largest revision that can be represented exactly in RFC 8785's IEEE-754
+/// JSON number domain.
+pub const MAX_CONTROL_REVISION: u64 = 9_007_199_254_740_991;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StagePhase {
@@ -56,6 +60,16 @@ impl StageState {
             paused_from_status_reason_digest: None,
             invalidation_cause_digest: None,
         }
+    }
+
+    /// Returns whether this is exactly the deterministic replay root produced by
+    /// [`StageState::new`].
+    pub fn is_pristine(&self) -> bool {
+        self == &Self::new(
+            self.stage_instance_id.clone(),
+            self.component_digest,
+            self.completion_predicate_digest,
+        )
     }
 
     /// Decides one lifecycle event without mutating state.
@@ -223,10 +237,10 @@ impl StageState {
             }
         }
 
-        next.control_revision = next
-            .control_revision
-            .checked_add(1)
-            .ok_or(StageTransitionError::RevisionOverflow)?;
+        if next.control_revision >= MAX_CONTROL_REVISION {
+            return Err(StageTransitionError::RevisionOverflow);
+        }
+        next.control_revision += 1;
         Ok(next)
     }
 }
@@ -640,6 +654,25 @@ mod tests {
         );
         assert_eq!(invalidated.phase, StagePhase::Invalidated);
         assert_eq!(invalidated.output_manifest_digest, Some(digest(b"output")));
+    }
+
+    #[test]
+    fn refuses_revisions_outside_the_exact_json_integer_domain() {
+        let mut state = initial();
+        state.phase = StagePhase::Running;
+        state.control_revision = MAX_CONTROL_REVISION;
+        let event = StageEvent {
+            stage_instance_id: state.stage_instance_id.clone(),
+            prior_control_revision: MAX_CONTROL_REVISION,
+            kind: StageEventKind::NodeBlocked {
+                reason_digest: digest(b"reason"),
+            },
+        };
+
+        assert_eq!(
+            state.apply(&event),
+            Err(StageTransitionError::RevisionOverflow)
+        );
     }
 
     #[test]

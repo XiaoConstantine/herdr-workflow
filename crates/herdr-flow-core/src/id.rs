@@ -99,6 +99,7 @@ typed_id!(RunId, "flow_");
 typed_id!(StageInstanceId, "stage_");
 typed_id!(RoleBindingId, "role_");
 typed_id!(MessageId, "msg_");
+typed_id!(EventId, "evt_");
 typed_id!(ArtifactId, "art_");
 typed_id!(ParticipantPrincipalId, "principal_");
 
