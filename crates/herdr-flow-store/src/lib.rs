@@ -3,13 +3,16 @@
 //! Atomic persistence adapters for Herdr Flow.
 
 mod artifact;
+mod registry;
 
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
+pub use registry::{ArtifactRegistration, StoredArtifactRecord};
 
 use std::{fmt, path::Path, str::FromStr, time::Duration};
 
 use herdr_flow_core::{
-    canonical_json, replay_stage, EventId, IdentifierError, MessageId, RunId, Sha256Digest,
+    canonical_json, replay_stage, ArtifactCatalog, ArtifactCatalogError, ArtifactId,
+    ArtifactRecordValidationError, EventId, IdentifierError, MessageId, RunId, Sha256Digest,
     StageEvent, StageInstanceId, StageState, StageTransitionError, BASE_PROTOCOL,
     MAX_CONTROL_REVISION,
 };
@@ -46,6 +49,7 @@ pub struct StoredStageEvent {
     pub message_digest: Sha256Digest,
     pub event_digest: Sha256Digest,
     pub event: StageEvent,
+    artifact_commitments: Vec<registry::ArtifactCommitment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -57,6 +61,7 @@ struct CanonicalCommittedEvent {
     message_digest: Sha256Digest,
     stage_instance_id: StageInstanceId,
     prior_control_revision: u64,
+    artifact_commitments: Vec<registry::ArtifactCommitment>,
     event: StageEvent,
 }
 
@@ -87,6 +92,14 @@ pub enum StoreError {
     IncompatiblePragma(&'static str),
     SnapshotMismatch,
     CorruptData(&'static str),
+    ArtifactStore(ArtifactStoreError),
+    ArtifactValidation(ArtifactRecordValidationError),
+    ArtifactGraph(ArtifactCatalogError),
+    ArtifactMetadataMismatch(&'static str),
+    ArtifactIdConflict,
+    ArtifactNotFound,
+    ArtifactRunMismatch,
+    ArtifactReferenceNotFound,
 }
 
 impl SqliteStore {
@@ -116,6 +129,7 @@ impl SqliteStore {
                 "
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
+                    pipeline_definition_digest TEXT NOT NULL,
                     next_event_sequence INTEGER NOT NULL
                         CHECK(next_event_sequence >= 1 AND next_event_sequence <= 9007199254740991)
                 ) STRICT;
@@ -153,6 +167,41 @@ impl SqliteStore {
 
                 CREATE INDEX IF NOT EXISTS events_stage_sequence
                     ON events(run_id, stage_instance_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    sha256 TEXT NOT NULL,
+                    size INTEGER NOT NULL CHECK(size >= 0),
+                    producer_stage_instance_id TEXT NOT NULL,
+                    producer_event_sequence INTEGER NOT NULL
+                        CHECK(producer_event_sequence >= 1 AND producer_event_sequence <= 9007199254740991),
+                    record_digest TEXT NOT NULL,
+                    record_json BLOB NOT NULL,
+                    UNIQUE(artifact_id, run_id),
+                    FOREIGN KEY(run_id, producer_event_sequence)
+                        REFERENCES events(run_id, sequence) ON DELETE RESTRICT,
+                    FOREIGN KEY(producer_stage_instance_id, run_id)
+                        REFERENCES stage_snapshots(stage_instance_id, run_id) ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE INDEX IF NOT EXISTS artifacts_run_sequence
+                    ON artifacts(run_id, producer_event_sequence, artifact_id);
+
+                CREATE TABLE IF NOT EXISTS artifact_edges (
+                    run_id TEXT NOT NULL,
+                    parent_artifact_id TEXT NOT NULL,
+                    child_artifact_id TEXT NOT NULL,
+                    PRIMARY KEY(run_id, parent_artifact_id, child_artifact_id),
+                    CHECK(parent_artifact_id <> child_artifact_id),
+                    FOREIGN KEY(parent_artifact_id, run_id)
+                        REFERENCES artifacts(artifact_id, run_id) ON DELETE RESTRICT,
+                    FOREIGN KEY(child_artifact_id, run_id)
+                        REFERENCES artifacts(artifact_id, run_id) ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE INDEX IF NOT EXISTS artifact_edges_child
+                    ON artifact_edges(run_id, child_artifact_id, parent_artifact_id);
                 ",
             )
             .map_err(StoreError::Sqlite)?;
@@ -165,12 +214,22 @@ impl SqliteStore {
     }
 
     /// Creates an empty run before any stage instances or events are registered.
-    pub fn create_run(&mut self, run_id: &RunId) -> Result<(), StoreError> {
+    pub fn create_run(
+        &mut self,
+        run_id: &RunId,
+        pipeline_definition_digest: &Sha256Digest,
+    ) -> Result<(), StoreError> {
         let inserted = self
             .connection
             .execute(
-                "INSERT OR IGNORE INTO runs(run_id, next_event_sequence) VALUES (?1, ?2)",
-                params![run_id.as_str(), INITIAL_EVENT_SEQUENCE as i64],
+                "INSERT OR IGNORE INTO runs(
+                    run_id, pipeline_definition_digest, next_event_sequence
+                 ) VALUES (?1, ?2, ?3)",
+                params![
+                    run_id.as_str(),
+                    pipeline_definition_digest.to_prefixed_string(),
+                    INITIAL_EVENT_SEQUENCE as i64
+                ],
             )
             .map_err(StoreError::Sqlite)?;
         if inserted == 0 {
@@ -211,12 +270,39 @@ impl SqliteStore {
     }
 
     /// Atomically appends one accepted stage event and its derived snapshot.
+    #[cfg(test)]
     pub fn append_stage_event(
         &mut self,
         request: AppendStageEvent<'_>,
     ) -> Result<AppendOutcome, StoreError> {
+        self.append_stage_event_inner(request, &[], false)
+    }
+
+    /// Makes artifact bytes durable first, then commits their immutable records,
+    /// provenance edges, accepted event, and derived snapshot in one transaction.
+    pub fn append_stage_event_with_artifacts(
+        &mut self,
+        request: AppendStageEvent<'_>,
+        artifact_store: &ArtifactStore,
+        registrations: &[ArtifactRegistration<'_>],
+    ) -> Result<AppendOutcome, StoreError> {
+        // The run lease excludes concurrent coordinators. Verify all previously
+        // committed metadata and bytes before accepting a transition that may
+        // consume them, then make this event's new bytes durable.
+        self.verify_run_artifacts(request.run_id, artifact_store)?;
+        let prepared = registry::prepare_artifacts(artifact_store, registrations)?;
+        self.append_stage_event_inner(request, &prepared, true)
+    }
+
+    fn append_stage_event_inner(
+        &mut self,
+        request: AppendStageEvent<'_>,
+        artifacts: &[registry::PreparedArtifact],
+        enforce_artifact_references: bool,
+    ) -> Result<AppendOutcome, StoreError> {
         #[cfg(test)]
         let fail_after_event_insert = self.fail_after_event_insert;
+        let artifact_commitments = registry::artifact_commitments(artifacts);
 
         let transaction = self
             .connection
@@ -229,7 +315,15 @@ impl SqliteStore {
             if existing.run_id == *request.run_id
                 && existing.message_digest == *request.message_digest
                 && existing.event == *request.event
+                && existing.artifact_commitments == artifact_commitments
             {
+                registry::verify_committed_artifacts(
+                    &transaction,
+                    request.run_id,
+                    existing.sequence,
+                    &existing.event.stage_instance_id,
+                    &artifact_commitments,
+                )?;
                 return Ok(AppendOutcome::Duplicate(existing));
             }
             return Err(StoreError::MessageIdConflict);
@@ -270,6 +364,7 @@ impl SqliteStore {
             message_digest: *request.message_digest,
             stage_instance_id: request.event.stage_instance_id.clone(),
             prior_control_revision: request.event.prior_control_revision,
+            artifact_commitments: artifact_commitments.clone(),
             event: request.event.clone(),
         };
         let record_value =
@@ -277,6 +372,24 @@ impl SqliteStore {
         let event_json =
             canonical_json::to_vec(&record_value).map_err(StoreError::Canonicalization)?;
         let event_digest = Sha256Digest::of_bytes(&event_json);
+
+        registry::validate_new_artifacts(
+            &transaction,
+            request.run_id,
+            &state,
+            &next_state,
+            request.event,
+            sequence,
+            artifacts,
+        )?;
+        if enforce_artifact_references {
+            registry::validate_event_artifact_references(
+                &transaction,
+                request.run_id,
+                request.event,
+                artifacts,
+            )?;
+        }
 
         transaction
             .execute(
@@ -297,6 +410,8 @@ impl SqliteStore {
                 ],
             )
             .map_err(StoreError::Sqlite)?;
+
+        registry::insert_artifacts(&transaction, request.run_id, artifacts)?;
 
         #[cfg(test)]
         if fail_after_event_insert {
@@ -344,6 +459,7 @@ impl SqliteStore {
             message_digest: *request.message_digest,
             event_digest,
             event: request.event.clone(),
+            artifact_commitments,
         };
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(AppendOutcome::Committed(stored))
@@ -402,6 +518,56 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         from_sql_integer(count)
+    }
+
+    /// Verifies the complete registry snapshot and every referenced byte object.
+    pub fn verify_run_artifacts(
+        &self,
+        run_id: &RunId,
+        artifact_store: &ArtifactStore,
+    ) -> Result<Vec<StoredArtifactRecord>, StoreError> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(StoreError::Sqlite)?;
+        verify_run_journal(&transaction, run_id)?;
+        let records = registry::load_and_verify_run_artifacts(&transaction, run_id)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        registry::verify_artifact_bytes(artifact_store, &records)?;
+        Ok(records)
+    }
+
+    pub fn load_artifact(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+        artifact_store: &ArtifactStore,
+    ) -> Result<StoredArtifactRecord, StoreError> {
+        self.verify_run_artifacts(run_id, artifact_store)?
+            .into_iter()
+            .find(|stored| stored.record.artifact_id == *artifact_id)
+            .ok_or(StoreError::ArtifactNotFound)
+    }
+
+    /// Computes deterministic transitive invalidation targets from verified
+    /// provenance edges. The changed root itself is not included.
+    pub fn artifact_descendants(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+        artifact_store: &ArtifactStore,
+    ) -> Result<Vec<ArtifactId>, StoreError> {
+        let records = self.verify_run_artifacts(run_id, artifact_store)?;
+        let mut catalog = ArtifactCatalog::new();
+        for stored in records {
+            catalog
+                .register(stored.record, &stored.parent_artifact_ids)
+                .map_err(StoreError::ArtifactGraph)?;
+        }
+        if catalog.record(artifact_id).is_none() {
+            return Err(StoreError::ArtifactNotFound);
+        }
+        Ok(catalog.descendants_of(artifact_id))
     }
 
     #[cfg(test)]
@@ -538,6 +704,13 @@ fn verify_run_journal(connection: &Connection, run_id: &RunId) -> Result<(), Sto
                 "run event sequence is not contiguous",
             ));
         }
+        registry::verify_committed_artifacts(
+            connection,
+            run_id,
+            stored.sequence,
+            &stored.event.stage_instance_id,
+            &stored.artifact_commitments,
+        )?;
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or(StoreError::EventSequenceExhausted)?;
@@ -629,6 +802,7 @@ fn decode_event_row(row: RawEventRow) -> Result<StoredStageEvent, StoreError> {
         message_digest,
         event_digest,
         event: record.event,
+        artifact_commitments: record.artifact_commitments,
     })
 }
 
@@ -702,6 +876,16 @@ impl fmt::Display for StoreError {
                 formatter.write_str("stage snapshot does not match deterministic event replay")
             }
             Self::CorruptData(message) => formatter.write_str(message),
+            Self::ArtifactStore(error) => error.fmt(formatter),
+            Self::ArtifactValidation(error) => error.fmt(formatter),
+            Self::ArtifactGraph(error) => error.fmt(formatter),
+            Self::ArtifactMetadataMismatch(message) => formatter.write_str(message),
+            Self::ArtifactIdConflict => formatter.write_str("artifact ID already exists"),
+            Self::ArtifactNotFound => formatter.write_str("artifact does not exist"),
+            Self::ArtifactRunMismatch => formatter.write_str("artifact belongs to another run"),
+            Self::ArtifactReferenceNotFound => {
+                formatter.write_str("event references an unregistered artifact digest")
+            }
         }
     }
 }
@@ -714,9 +898,9 @@ impl From<rusqlite::Error> for StoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
-    use herdr_flow_core::{replay_stage, StageCommand, StageEventKind};
+    use herdr_flow_core::{replay_stage, ArtifactRecord, StageCommand, StageEventKind};
     use tempfile::TempDir;
 
     use super::*;
@@ -727,6 +911,12 @@ mod tests {
     const EVENT_ULID_2: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA1";
     const MESSAGE_ULID_1: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA2";
     const MESSAGE_ULID_2: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA3";
+    const EVENT_ULID_3: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA4";
+    const EVENT_ULID_4: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA5";
+    const MESSAGE_ULID_3: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA6";
+    const MESSAGE_ULID_4: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA7";
+    const ARTIFACT_ULID_1: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA8";
+    const ARTIFACT_ULID_2: &str = "01ARZ3NDEKTSV4RRFFQ69G5FA9";
 
     struct TestStore {
         _directory: TempDir,
@@ -750,7 +940,7 @@ mod tests {
             digest(b"component"),
             digest(b"predicate"),
         );
-        store.create_run(&run_id).unwrap();
+        store.create_run(&run_id, &digest(b"pipeline")).unwrap();
         store.register_stage(&run_id, &initial).unwrap();
         TestStore {
             _directory: directory,
@@ -776,6 +966,76 @@ mod tests {
                 input_manifest_digest: digest(input),
             })
             .unwrap()
+    }
+
+    fn append_transition(
+        test: &mut TestStore,
+        event: &StageEvent,
+        event_ulid: &str,
+        message_ulid: &str,
+    ) {
+        test.store
+            .append_stage_event(AppendStageEvent {
+                run_id: &test.run_id,
+                event_id: &event_id(event_ulid),
+                message_id: &message_id(message_ulid),
+                message_digest: &digest(message_ulid.as_bytes()),
+                event,
+            })
+            .unwrap();
+    }
+
+    fn advance_to_running(test: &mut TestStore) -> StageState {
+        let ready = ready_event(&test.initial, b"input-manifest");
+        append_transition(test, &ready, EVENT_ULID_1, MESSAGE_ULID_1);
+        let ready_state = test
+            .store
+            .load_stage(&test.run_id, &test.initial.stage_instance_id)
+            .unwrap();
+        let provisioning = ready_state
+            .decide(StageCommand::BeginProvisioning {
+                expected_revision: ready_state.control_revision,
+            })
+            .unwrap();
+        append_transition(test, &provisioning, EVENT_ULID_2, MESSAGE_ULID_2);
+        let provisioning_state = test
+            .store
+            .load_stage(&test.run_id, &test.initial.stage_instance_id)
+            .unwrap();
+        let started = provisioning_state
+            .decide(StageCommand::StartAttempt {
+                expected_revision: provisioning_state.control_revision,
+            })
+            .unwrap();
+        append_transition(test, &started, EVENT_ULID_3, MESSAGE_ULID_3);
+        test.store
+            .load_stage(&test.run_id, &test.initial.stage_instance_id)
+            .unwrap()
+    }
+
+    fn artifact_record(
+        artifact_ulid: &str,
+        artifact_type: &str,
+        schema_id: &str,
+        bytes: &[u8],
+        state: &StageState,
+    ) -> ArtifactRecord {
+        ArtifactRecord {
+            artifact_id: format!("art_{artifact_ulid}").parse().unwrap(),
+            artifact_type: artifact_type.to_owned(),
+            schema_id: schema_id.to_owned(),
+            schema_version: 1,
+            sha256: digest(bytes),
+            size: bytes.len() as u64,
+            media_type: "application/json".to_owned(),
+            producer_stage_instance_id: state.stage_instance_id.clone(),
+            producer_attempt: state.attempt,
+            producer_event_sequence: 4,
+            pipeline_definition_digest: digest(b"pipeline"),
+            component_digest: state.component_digest,
+            input_manifest_digest: state.input_manifest_digest.unwrap(),
+            retention_class: "run-record".to_owned(),
+        }
     }
 
     #[test]
@@ -1161,6 +1421,560 @@ mod tests {
         assert!(matches!(
             test.store.register_stage(&test.run_id, &invalid),
             Err(StoreError::InvalidInitialStage)
+        ));
+    }
+
+    #[test]
+    fn production_api_bootstraps_ingress_and_reaches_running() {
+        let mut test = test_store();
+        let artifact_store = ArtifactStore::open(test._directory.path().join("artifacts")).unwrap();
+        let input_bytes = br#"{"inputs":[]}"#;
+        let input_digest = digest(input_bytes);
+        let ingress = ArtifactRecord {
+            artifact_id: format!("art_{ARTIFACT_ULID_1}").parse().unwrap(),
+            artifact_type: "stage-input-manifest/v1".to_owned(),
+            schema_id: "stage-input-manifest".to_owned(),
+            schema_version: 1,
+            sha256: input_digest,
+            size: input_bytes.len() as u64,
+            media_type: "application/json".to_owned(),
+            producer_stage_instance_id: test.initial.stage_instance_id.clone(),
+            producer_attempt: 0,
+            producer_event_sequence: 1,
+            pipeline_definition_digest: digest(b"pipeline"),
+            component_digest: test.initial.component_digest,
+            input_manifest_digest: input_digest,
+            retention_class: "run-record".to_owned(),
+        };
+        let ready = ready_event(&test.initial, input_bytes);
+        test.store
+            .append_stage_event_with_artifacts(
+                AppendStageEvent {
+                    run_id: &test.run_id,
+                    event_id: &event_id(EVENT_ULID_1),
+                    message_id: &message_id(MESSAGE_ULID_1),
+                    message_digest: &digest(b"ready-message"),
+                    event: &ready,
+                },
+                &artifact_store,
+                &[ArtifactRegistration {
+                    record: &ingress,
+                    parent_artifact_ids: &[],
+                    bytes: input_bytes,
+                }],
+            )
+            .unwrap();
+
+        let ready_state = test
+            .store
+            .load_stage(&test.run_id, &test.initial.stage_instance_id)
+            .unwrap();
+        let provisioning = ready_state
+            .decide(StageCommand::BeginProvisioning {
+                expected_revision: ready_state.control_revision,
+            })
+            .unwrap();
+        test.store
+            .append_stage_event_with_artifacts(
+                AppendStageEvent {
+                    run_id: &test.run_id,
+                    event_id: &event_id(EVENT_ULID_2),
+                    message_id: &message_id(MESSAGE_ULID_2),
+                    message_digest: &digest(b"provisioning-message"),
+                    event: &provisioning,
+                },
+                &artifact_store,
+                &[],
+            )
+            .unwrap();
+        let provisioning_state = test
+            .store
+            .load_stage(&test.run_id, &test.initial.stage_instance_id)
+            .unwrap();
+        let started = provisioning_state
+            .decide(StageCommand::StartAttempt {
+                expected_revision: provisioning_state.control_revision,
+            })
+            .unwrap();
+        test.store
+            .append_stage_event_with_artifacts(
+                AppendStageEvent {
+                    run_id: &test.run_id,
+                    event_id: &event_id(EVENT_ULID_3),
+                    message_id: &message_id(MESSAGE_ULID_3),
+                    message_digest: &digest(b"started-message"),
+                    event: &started,
+                },
+                &artifact_store,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(
+            test.store
+                .load_stage(&test.run_id, &test.initial.stage_instance_id)
+                .unwrap()
+                .phase,
+            herdr_flow_core::StagePhase::Running
+        );
+        assert_eq!(
+            test.store
+                .verify_run_artifacts(&test.run_id, &artifact_store)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn complete_with_artifacts(
+        test: &mut TestStore,
+        artifact_store: &ArtifactStore,
+    ) -> (ArtifactRecord, ArtifactRecord) {
+        let running = advance_to_running(test);
+        let parent_bytes = br#"{"kind":"parent"}"#;
+        let child_bytes = br#"{"kind":"child"}"#;
+        let parent = artifact_record(
+            ARTIFACT_ULID_1,
+            "review-package/v1",
+            "review-package",
+            parent_bytes,
+            &running,
+        );
+        let child = artifact_record(
+            ARTIFACT_ULID_2,
+            "publication-manifest/v1",
+            "publication-manifest",
+            child_bytes,
+            &running,
+        );
+        let completed = running
+            .decide(StageCommand::Complete {
+                expected_revision: running.control_revision,
+                output_manifest_digest: child.sha256,
+                completion_predicate_digest: running.completion_predicate_digest,
+                completion_evidence_digest: parent.sha256,
+            })
+            .unwrap();
+        let event_id = event_id(EVENT_ULID_4);
+        let message_id = message_id(MESSAGE_ULID_4);
+        let message_digest = digest(b"completion-message");
+        let registrations = [
+            ArtifactRegistration {
+                record: &parent,
+                parent_artifact_ids: &[],
+                bytes: parent_bytes,
+            },
+            ArtifactRegistration {
+                record: &child,
+                parent_artifact_ids: std::slice::from_ref(&parent.artifact_id),
+                bytes: child_bytes,
+            },
+        ];
+        test.store
+            .append_stage_event_with_artifacts(
+                AppendStageEvent {
+                    run_id: &test.run_id,
+                    event_id: &event_id,
+                    message_id: &message_id,
+                    message_digest: &message_digest,
+                    event: &completed,
+                },
+                artifact_store,
+                &registrations,
+            )
+            .unwrap();
+        (parent, child)
+    }
+
+    #[test]
+    fn artifact_bytes_records_edges_and_completion_commit_as_one_unit() {
+        let mut test = test_store();
+        let artifact_store = ArtifactStore::open(test._directory.path().join("artifacts")).unwrap();
+        let (parent, child) = complete_with_artifacts(&mut test, &artifact_store);
+
+        let records = test
+            .store
+            .verify_run_artifacts(&test.run_id, &artifact_store)
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            test.store
+                .load_artifact(&test.run_id, &child.artifact_id, &artifact_store)
+                .unwrap()
+                .parent_artifact_ids,
+            vec![parent.artifact_id.clone()]
+        );
+        assert_eq!(
+            test.store
+                .artifact_descendants(&test.run_id, &parent.artifact_id, &artifact_store)
+                .unwrap(),
+            vec![child.artifact_id.clone()]
+        );
+        assert_eq!(
+            test.store
+                .load_stage(&test.run_id, &test.initial.stage_instance_id)
+                .unwrap()
+                .phase,
+            herdr_flow_core::StagePhase::Completed
+        );
+
+        let events = test
+            .store
+            .load_stage_events(&test.run_id, &test.initial.stage_instance_id)
+            .unwrap();
+        assert!(matches!(
+            test.store.append_stage_event(AppendStageEvent {
+                run_id: &test.run_id,
+                event_id: &event_id(EVENT_ULID_4),
+                message_id: &message_id(MESSAGE_ULID_4),
+                message_digest: &digest(b"completion-message"),
+                event: &events[3].event,
+            }),
+            Err(StoreError::MessageIdConflict)
+        ));
+
+        let parent_bytes = br#"{"kind":"parent"}"#;
+        let child_bytes = br#"{"kind":"child"}"#;
+        let registrations = [
+            ArtifactRegistration {
+                record: &parent,
+                parent_artifact_ids: &[],
+                bytes: parent_bytes,
+            },
+            ArtifactRegistration {
+                record: &child,
+                parent_artifact_ids: std::slice::from_ref(&parent.artifact_id),
+                bytes: child_bytes,
+            },
+        ];
+        assert!(matches!(
+            test.store
+                .append_stage_event_with_artifacts(
+                    AppendStageEvent {
+                        run_id: &test.run_id,
+                        event_id: &event_id(EVENT_ULID_4),
+                        message_id: &message_id(MESSAGE_ULID_4),
+                        message_digest: &digest(b"completion-message"),
+                        event: &events[3].event,
+                    },
+                    &artifact_store,
+                    &registrations,
+                )
+                .unwrap(),
+            AppendOutcome::Duplicate(_)
+        ));
+        assert_eq!(test.store.event_count(&test.run_id).unwrap(), 4);
+    }
+
+    #[test]
+    fn post_insert_failure_rolls_back_artifacts_event_and_snapshot_together() {
+        let mut test = test_store();
+        let artifact_store = ArtifactStore::open(test._directory.path().join("artifacts")).unwrap();
+        let running = advance_to_running(&mut test);
+        let bytes = br#"{"kind":"output"}"#;
+        let record = artifact_record(
+            ARTIFACT_ULID_1,
+            "review-package/v1",
+            "review-package",
+            bytes,
+            &running,
+        );
+        let completed = running
+            .decide(StageCommand::Complete {
+                expected_revision: running.control_revision,
+                output_manifest_digest: record.sha256,
+                completion_predicate_digest: running.completion_predicate_digest,
+                completion_evidence_digest: record.sha256,
+            })
+            .unwrap();
+        let event_id = event_id(EVENT_ULID_4);
+        let message_id = message_id(MESSAGE_ULID_4);
+        let message_digest = digest(b"completion-message");
+        let registration = [ArtifactRegistration {
+            record: &record,
+            parent_artifact_ids: &[],
+            bytes,
+        }];
+        test.store.inject_failure_after_event_insert(true);
+
+        assert!(matches!(
+            test.store.append_stage_event_with_artifacts(
+                AppendStageEvent {
+                    run_id: &test.run_id,
+                    event_id: &event_id,
+                    message_id: &message_id,
+                    message_digest: &message_digest,
+                    event: &completed,
+                },
+                &artifact_store,
+                &registration,
+            ),
+            Err(StoreError::CorruptData("injected post-insert failure"))
+        ));
+        assert_eq!(test.store.event_count(&test.run_id).unwrap(), 3);
+        let artifact_count: i64 = test
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(artifact_count, 0);
+        assert_eq!(
+            test.store
+                .load_stage(&test.run_id, &test.initial.stage_instance_id)
+                .unwrap(),
+            running
+        );
+    }
+
+    #[test]
+    fn accepted_event_cannot_reference_an_unregistered_artifact_digest() {
+        let mut test = test_store();
+        let artifact_store = ArtifactStore::open(test._directory.path().join("artifacts")).unwrap();
+        let running = advance_to_running(&mut test);
+        let bytes = b"output";
+        let record = artifact_record(
+            ARTIFACT_ULID_1,
+            "review-package/v1",
+            "review-package",
+            bytes,
+            &running,
+        );
+        let completed = running
+            .decide(StageCommand::Complete {
+                expected_revision: running.control_revision,
+                output_manifest_digest: record.sha256,
+                completion_predicate_digest: running.completion_predicate_digest,
+                completion_evidence_digest: digest(b"missing-evidence"),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            test.store.append_stage_event_with_artifacts(
+                AppendStageEvent {
+                    run_id: &test.run_id,
+                    event_id: &event_id(EVENT_ULID_4),
+                    message_id: &message_id(MESSAGE_ULID_4),
+                    message_digest: &digest(b"completion-message"),
+                    event: &completed,
+                },
+                &artifact_store,
+                &[ArtifactRegistration {
+                    record: &record,
+                    parent_artifact_ids: &[],
+                    bytes,
+                }],
+            ),
+            Err(StoreError::ArtifactReferenceNotFound)
+        ));
+        assert_eq!(test.store.event_count(&test.run_id).unwrap(), 3);
+        assert_eq!(
+            test.store
+                .load_stage(&test.run_id, &test.initial.stage_instance_id)
+                .unwrap(),
+            running
+        );
+    }
+
+    #[test]
+    fn artifact_registration_rejects_unbound_metadata_without_accepting_event() {
+        let mut test = test_store();
+        let artifact_store = ArtifactStore::open(test._directory.path().join("artifacts")).unwrap();
+        let running = advance_to_running(&mut test);
+        let bytes = b"output";
+        let mut record = artifact_record(
+            ARTIFACT_ULID_1,
+            "review-package/v1",
+            "review-package",
+            bytes,
+            &running,
+        );
+        record.pipeline_definition_digest = digest(b"another-pipeline");
+        let completed = running
+            .decide(StageCommand::Complete {
+                expected_revision: running.control_revision,
+                output_manifest_digest: record.sha256,
+                completion_predicate_digest: running.completion_predicate_digest,
+                completion_evidence_digest: digest(b"evidence"),
+            })
+            .unwrap();
+
+        let append = |store: &mut SqliteStore, record: &ArtifactRecord| {
+            store.append_stage_event_with_artifacts(
+                AppendStageEvent {
+                    run_id: &test.run_id,
+                    event_id: &event_id(EVENT_ULID_4),
+                    message_id: &message_id(MESSAGE_ULID_4),
+                    message_digest: &digest(b"completion-message"),
+                    event: &completed,
+                },
+                &artifact_store,
+                &[ArtifactRegistration {
+                    record,
+                    parent_artifact_ids: &[],
+                    bytes,
+                }],
+            )
+        };
+        assert!(matches!(
+            append(&mut test.store, &record),
+            Err(StoreError::ArtifactMetadataMismatch(
+                "pipeline definition digest does not match the run"
+            ))
+        ));
+        record.pipeline_definition_digest = digest(b"pipeline");
+        record.producer_event_sequence = 5;
+        assert!(matches!(
+            append(&mut test.store, &record),
+            Err(StoreError::ArtifactMetadataMismatch(
+                "producer sequence does not match accepted event"
+            ))
+        ));
+        assert_eq!(test.store.event_count(&test.run_id).unwrap(), 3);
+        assert_eq!(
+            test.store
+                .load_stage(&test.run_id, &test.initial.stage_instance_id)
+                .unwrap(),
+            running
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_missing_bytes_and_tampered_registry_records() {
+        let mut test = test_store();
+        let artifact_store = ArtifactStore::open(test._directory.path().join("artifacts")).unwrap();
+        let (parent, child) = complete_with_artifacts(&mut test, &artifact_store);
+        test.store
+            .connection
+            .execute(
+                "UPDATE runs SET pipeline_definition_digest = ?1 WHERE run_id = ?2",
+                params![
+                    digest(b"another-pipeline").to_prefixed_string(),
+                    test.run_id.as_str()
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            test.store
+                .verify_run_artifacts(&test.run_id, &artifact_store),
+            Err(StoreError::ArtifactMetadataMismatch(
+                "pipeline definition digest does not match the run"
+            ))
+        ));
+        test.store
+            .connection
+            .execute(
+                "UPDATE runs SET pipeline_definition_digest = ?1 WHERE run_id = ?2",
+                params![
+                    digest(b"pipeline").to_prefixed_string(),
+                    test.run_id.as_str()
+                ],
+            )
+            .unwrap();
+
+        let second_stage = StageState::new(
+            format!("stage_{RUN_ULID}").parse().unwrap(),
+            digest(b"other-component"),
+            digest(b"other-predicate"),
+        );
+        test.store
+            .register_stage(&test.run_id, &second_stage)
+            .unwrap();
+        test.store
+            .connection
+            .execute(
+                "UPDATE artifacts SET producer_stage_instance_id = ?1 WHERE artifact_id = ?2",
+                params![
+                    second_stage.stage_instance_id.as_str(),
+                    parent.artifact_id.as_str()
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            test.store
+                .verify_run_artifacts(&test.run_id, &artifact_store),
+            Err(StoreError::ArtifactMetadataMismatch(
+                "indexed artifact columns do not match canonical record"
+            ))
+        ));
+        test.store
+            .connection
+            .execute(
+                "UPDATE artifacts SET producer_stage_instance_id = ?1 WHERE artifact_id = ?2",
+                params![
+                    parent.producer_stage_instance_id.as_str(),
+                    parent.artifact_id.as_str()
+                ],
+            )
+            .unwrap();
+        test.store
+            .connection
+            .execute(
+                "DELETE FROM artifact_edges WHERE child_artifact_id = ?1",
+                params![child.artifact_id.as_str()],
+            )
+            .unwrap();
+        assert!(matches!(
+            test.store
+                .verify_run_artifacts(&test.run_id, &artifact_store),
+            Err(StoreError::ArtifactMetadataMismatch(
+                "event artifact commitment mismatch"
+            ))
+        ));
+        test.store
+            .connection
+            .execute(
+                "INSERT INTO artifact_edges(run_id, parent_artifact_id, child_artifact_id)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    test.run_id.as_str(),
+                    parent.artifact_id.as_str(),
+                    child.artifact_id.as_str()
+                ],
+            )
+            .unwrap();
+        test.store
+            .connection
+            .execute(
+                "UPDATE artifacts SET record_digest = ?1 WHERE artifact_id = ?2",
+                params![
+                    digest(b"tampered").to_prefixed_string(),
+                    parent.artifact_id.as_str()
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            test.store
+                .verify_run_artifacts(&test.run_id, &artifact_store),
+            Err(StoreError::ArtifactMetadataMismatch(
+                "artifact record digest mismatch"
+            ))
+        ));
+
+        test.store
+            .connection
+            .execute(
+                "UPDATE artifacts SET record_digest = ?1 WHERE artifact_id = ?2",
+                params![
+                    Sha256Digest::of_bytes(
+                        &canonical_json::to_vec(&serde_json::to_value(&parent).unwrap()).unwrap()
+                    )
+                    .to_prefixed_string(),
+                    parent.artifact_id.as_str()
+                ],
+            )
+            .unwrap();
+        let digest_text = parent.sha256.to_prefixed_string();
+        fs::remove_file(
+            artifact_store
+                .root()
+                .join("sha256")
+                .join(&digest_text["sha256:".len()..]),
+        )
+        .unwrap();
+        assert!(matches!(
+            test.store
+                .verify_run_artifacts(&test.run_id, &artifact_store),
+            Err(StoreError::ArtifactStore(_))
         ));
     }
 

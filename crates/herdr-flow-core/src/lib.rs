@@ -10,12 +10,16 @@
 
 extern crate alloc;
 
+mod artifact;
 pub mod canonical_json;
 mod digest;
 mod envelope;
 mod id;
 mod stage;
 
+pub use artifact::{
+    ArtifactCatalog, ArtifactCatalogError, ArtifactRecord, ArtifactRecordValidationError,
+};
 pub use digest::{DigestParseError, Sha256Digest};
 pub use envelope::{
     ArtifactReference, AuthenticatedAgentContext, Envelope, EnvelopeParseError,
