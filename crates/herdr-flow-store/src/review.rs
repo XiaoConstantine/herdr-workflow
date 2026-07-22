@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 type AdversarialReviewEventRow = (String, String, i64, String, String, String, Vec<u8>);
 
 use crate::{
-    event_id_exists, from_sql_integer, registry, require_run, to_sql_integer, verified_stage,
-    verify_run_journal, ArtifactStore, GitRepository, SqliteStore, StoreError,
+    event_id_exists, from_sql_integer,
+    lease::{lease_now, LeasedRun, RunLeaseFence, UnixMillisClock},
+    registry, to_sql_integer, verified_stage, verify_run_journal, ArtifactStore, GitRepository,
+    SqliteStore, StoreError,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -290,6 +292,7 @@ fn prepare_submitted_candidate(
 }
 
 impl SqliteStore {
+    #[cfg(test)]
     pub fn register_adversarial_review(
         &mut self,
         run_id: &RunId,
@@ -302,7 +305,7 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
-        require_run(&transaction, run_id)?;
+        crate::require_run(&transaction, run_id)?;
         verify_run_journal(&transaction, run_id)?;
         let stage_exists = transaction
             .query_row(
@@ -333,6 +336,7 @@ impl SqliteStore {
         transaction.commit().map_err(StoreError::Sqlite)
     }
 
+    #[cfg(test)]
     pub fn submit_adversarial_review_command(
         &mut self,
         artifact_store: &ArtifactStore,
@@ -346,6 +350,7 @@ impl SqliteStore {
             submission,
             true,
             prepared_candidate,
+            None,
         )
     }
 
@@ -355,7 +360,14 @@ impl SqliteStore {
         artifact_store: &ArtifactStore,
         submission: AdversarialReviewSubmission<'_>,
     ) -> Result<AppendAdversarialReviewOutcome, StoreError> {
-        self.submit_adversarial_review_command_inner(artifact_store, None, submission, false, None)
+        self.submit_adversarial_review_command_inner(
+            artifact_store,
+            None,
+            submission,
+            false,
+            None,
+            None,
+        )
     }
 
     fn submit_adversarial_review_command_inner(
@@ -365,6 +377,7 @@ impl SqliteStore {
         submission: AdversarialReviewSubmission<'_>,
         validate_candidate: bool,
         prepared_candidate: Option<Sha256Digest>,
+        lease: Option<(&RunLeaseFence, &dyn UnixMillisClock)>,
     ) -> Result<AppendAdversarialReviewOutcome, StoreError> {
         let AdversarialReviewSubmission {
             run_id,
@@ -380,6 +393,12 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
+        if let Some((fence, clock)) = lease {
+            lease_now(&transaction, fence, clock)?;
+            if fence.run_id() != run_id {
+                return Err(StoreError::RunLeaseRequired);
+            }
+        }
         verify_run_journal(&transaction, run_id)?;
         verify_adversarial_review_candidate_bytes(&transaction, run_id, artifact_store)?;
         let state = verified_adversarial_review(&transaction, run_id, stage_instance_id)?;
@@ -680,6 +699,25 @@ impl SqliteStore {
         let state = verified_adversarial_review(&transaction, run_id, stage_instance_id)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(state)
+    }
+}
+
+impl LeasedRun<'_, '_> {
+    pub fn submit_adversarial_review_command(
+        &mut self,
+        artifact_store: &ArtifactStore,
+        git_repository: &GitRepository,
+        submission: AdversarialReviewSubmission<'_>,
+    ) -> Result<AppendAdversarialReviewOutcome, StoreError> {
+        let prepared_candidate = prepare_submitted_candidate(artifact_store, &submission)?;
+        self.store.submit_adversarial_review_command_inner(
+            artifact_store,
+            Some(git_repository),
+            submission,
+            true,
+            prepared_candidate,
+            Some((&self.fence, self.clock)),
+        )
     }
 }
 

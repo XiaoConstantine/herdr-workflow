@@ -10,9 +10,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    event_by_message_id, event_id_exists, from_sql_integer, registry, require_run, to_sql_integer,
-    verified_stage, verify_run_journal, ArtifactRegistration, ArtifactStore,
-    CanonicalCommittedEvent, SqliteStore, StoreError,
+    event_by_message_id, event_id_exists, from_sql_integer,
+    lease::{lease_now, LeasedRun, RunLeaseFence, UnixMillisClock},
+    registry, require_run, to_sql_integer, verified_stage, verify_run_journal,
+    ArtifactRegistration, ArtifactStore, CanonicalCommittedEvent, SqliteStore, StoreError,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,12 +195,24 @@ impl SqliteStore {
         transaction.commit().map_err(StoreError::Sqlite)
     }
 
+    #[cfg(test)]
     pub fn register_m1_pipeline(
         &mut self,
         run_id: &RunId,
         state: &PipelineState,
         review: &crate::AdversarialReviewRegistration,
         gate: &PublicationGateState,
+    ) -> Result<(), StoreError> {
+        self.register_m1_pipeline_inner(run_id, state, review, gate, None)
+    }
+
+    fn register_m1_pipeline_inner(
+        &mut self,
+        run_id: &RunId,
+        state: &PipelineState,
+        review: &crate::AdversarialReviewRegistration,
+        gate: &PublicationGateState,
+        lease: Option<(&RunLeaseFence, &dyn UnixMillisClock)>,
     ) -> Result<(), StoreError> {
         if !state.is_pristine() {
             return Err(StoreError::InvalidInitialPipeline);
@@ -226,6 +239,12 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
+        if let Some((fence, clock)) = lease {
+            lease_now(&transaction, fence, clock)?;
+            if fence.run_id() != run_id {
+                return Err(StoreError::RunLeaseRequired);
+            }
+        }
         require_run(&transaction, run_id)?;
         verify_run_journal(&transaction, run_id)?;
         let root_count: i64 = transaction
@@ -378,10 +397,20 @@ impl SqliteStore {
         transaction.commit().map_err(StoreError::Sqlite)
     }
 
+    #[cfg(test)]
     pub fn append_semantic_batch(
         &mut self,
         artifact_store: &ArtifactStore,
         batch: SemanticBatch<'_>,
+    ) -> Result<SemanticCommitOutcome, StoreError> {
+        self.append_semantic_batch_inner(artifact_store, batch, None)
+    }
+
+    fn append_semantic_batch_inner(
+        &mut self,
+        artifact_store: &ArtifactStore,
+        batch: SemanticBatch<'_>,
+        lease: Option<(&RunLeaseFence, &dyn UnixMillisClock)>,
     ) -> Result<SemanticCommitOutcome, StoreError> {
         if batch.pipeline_entries.is_empty() && batch.publication_gate_entries.is_empty() {
             return Err(StoreError::EmptySemanticBatch);
@@ -398,6 +427,12 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
+        if let Some((fence, clock)) = lease {
+            lease_now(&transaction, fence, clock)?;
+            if fence.run_id() != batch.run_id {
+                return Err(StoreError::RunLeaseRequired);
+            }
+        }
         verify_run_journal(&transaction, batch.run_id)?;
         validate_registered_m1_batch(&transaction, &batch)?;
         let next_sequence: i64 = transaction
@@ -639,6 +674,36 @@ impl SqliteStore {
         let events = load_pipeline_events(&transaction, run_id)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(events)
+    }
+}
+
+impl LeasedRun<'_, '_> {
+    pub fn register_m1_pipeline(
+        &mut self,
+        state: &PipelineState,
+        review: &crate::AdversarialReviewRegistration,
+        gate: &PublicationGateState,
+    ) -> Result<(), StoreError> {
+        let run_id = self.fence.run_id().clone();
+        self.store.register_m1_pipeline_inner(
+            &run_id,
+            state,
+            review,
+            gate,
+            Some((&self.fence, self.clock)),
+        )
+    }
+
+    pub fn append_semantic_batch(
+        &mut self,
+        artifact_store: &ArtifactStore,
+        batch: SemanticBatch<'_>,
+    ) -> Result<SemanticCommitOutcome, StoreError> {
+        self.store.append_semantic_batch_inner(
+            artifact_store,
+            batch,
+            Some((&self.fence, self.clock)),
+        )
     }
 }
 

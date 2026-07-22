@@ -6,6 +6,7 @@ mod adapter;
 mod artifact;
 mod git;
 mod human;
+mod lease;
 mod outbox;
 mod pipeline;
 mod registry;
@@ -19,10 +20,13 @@ pub use adapter::{
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
 pub use git::{GitRepository, GitRepositoryError, SnapshotRefOutcome};
 pub use human::{QueuedHumanAction, QueuedHumanActionStatus};
+pub use lease::{ClockError, LeasedRun, RunLeaseFence, SystemClock, UnixMillisClock};
+#[cfg(test)]
+pub use outbox::reconcile_publication;
 pub use outbox::{
-    reconcile_publication, ChangeRequestResult, PublicationIntent, PublicationIntentKind,
-    PublicationIntentRecord, PublicationOutboxStatus, PublicationProvider,
-    PublicationProviderError, PublicationResult, PushResult, ReconcileOutcome,
+    ChangeRequestResult, PublicationIntent, PublicationIntentKind, PublicationIntentRecord,
+    PublicationOutboxStatus, PublicationProvider, PublicationProviderError, PublicationResult,
+    PushResult, ReconcileOutcome,
 };
 pub use pipeline::{
     SemanticBatch, SemanticCommitOutcome, SemanticPipelineEntry, SemanticPublicationGateEntry,
@@ -40,7 +44,7 @@ use herdr_flow_core::{
     canonical_json, replay_stage, ArtifactCatalog, ArtifactCatalogError, ArtifactId,
     ArtifactRecordValidationError, EventId, IdentifierError, MessageId, PipelineTransitionError,
     RunId, Sha256Digest, StageEvent, StageInstanceId, StageState, StageTransitionError,
-    BASE_PROTOCOL, MAX_CONTROL_REVISION,
+    BASE_PROTOCOL,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -160,6 +164,11 @@ pub enum StoreError {
     AdapterContract(AdapterContractError),
     AgentBindingConflict,
     AgentBindingNotFound,
+    RunLeaseConflict,
+    RunLeaseExpired,
+    RunLeaseRequired,
+    InvalidRunLeaseDuration,
+    Clock(ClockError),
 }
 
 impl SqliteStore {
@@ -313,6 +322,23 @@ impl SqliteStore {
 
                 CREATE INDEX IF NOT EXISTS publication_gate_events_run_sequence
                     ON publication_gate_events(run_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS run_leases (
+                    run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    lease_epoch INTEGER NOT NULL CHECK(
+                        lease_epoch >= 0 AND lease_epoch <= 9007199254740991
+                    ),
+                    owner_id TEXT,
+                    expires_at_unix_ms INTEGER,
+                    CHECK (
+                        (owner_id IS NULL AND expires_at_unix_ms IS NULL) OR
+                        (owner_id IS NOT NULL AND expires_at_unix_ms IS NOT NULL)
+                    )
+                ) STRICT;
+
+                INSERT INTO run_leases(run_id, lease_epoch, owner_id, expires_at_unix_ms)
+                    SELECT run_id, 0, NULL, NULL FROM runs
+                    WHERE run_id NOT IN (SELECT run_id FROM run_leases);
 
                 CREATE TABLE IF NOT EXISTS agent_session_bindings (
                     run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
@@ -483,8 +509,11 @@ impl SqliteStore {
         run_id: &RunId,
         pipeline_definition_digest: &Sha256Digest,
     ) -> Result<(), StoreError> {
-        let inserted = self
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO runs(
                     run_id, pipeline_definition_digest, next_event_sequence
@@ -499,11 +528,19 @@ impl SqliteStore {
         if inserted == 0 {
             return Err(StoreError::RunAlreadyExists);
         }
-        Ok(())
+        transaction
+            .execute(
+                "INSERT INTO run_leases(run_id, lease_epoch, owner_id, expires_at_unix_ms)
+                 VALUES (?1, 0, NULL, NULL)",
+                params![run_id.as_str()],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)
     }
 
     /// Registers the deterministic initial snapshot for a stage before its first
     /// lifecycle event. Pipeline scheduling will eventually own this bootstrap.
+    #[cfg(test)]
     pub fn register_stage(&mut self, run_id: &RunId, state: &StageState) -> Result<(), StoreError> {
         if !state.is_pristine() {
             return Err(StoreError::InvalidInitialStage);
@@ -547,6 +584,7 @@ impl SqliteStore {
 
     /// Makes artifact bytes durable first, then commits their immutable records,
     /// provenance edges, accepted event, and derived snapshot in one transaction.
+    #[cfg(test)]
     pub fn append_stage_event_with_artifacts(
         &mut self,
         request: AppendStageEvent<'_>,
@@ -561,6 +599,7 @@ impl SqliteStore {
         self.append_stage_event_inner(request, &prepared, true)
     }
 
+    #[cfg(test)]
     fn append_stage_event_inner(
         &mut self,
         request: AppendStageEvent<'_>,
@@ -625,7 +664,7 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?
             .ok_or(StoreError::RunNotFound)?;
         let sequence = from_sql_integer(next_sequence)?;
-        if sequence >= MAX_CONTROL_REVISION {
+        if sequence >= herdr_flow_core::MAX_CONTROL_REVISION {
             return Err(StoreError::EventSequenceExhausted);
         }
 
@@ -1295,6 +1334,13 @@ impl fmt::Display for StoreError {
                 formatter.write_str("agent binding conflicts with durable assignment")
             }
             Self::AgentBindingNotFound => formatter.write_str("agent binding was not found"),
+            Self::RunLeaseConflict => {
+                formatter.write_str("run lease is held by another coordinator")
+            }
+            Self::RunLeaseExpired => formatter.write_str("run lease is expired or fenced"),
+            Self::RunLeaseRequired => formatter.write_str("an active run lease is required"),
+            Self::InvalidRunLeaseDuration => formatter.write_str("run lease duration is invalid"),
+            Self::Clock(error) => write!(formatter, "clock failed: {error}"),
         }
     }
 }

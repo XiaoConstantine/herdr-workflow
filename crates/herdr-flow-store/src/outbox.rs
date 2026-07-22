@@ -7,10 +7,12 @@ use herdr_flow_core::{
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 type ClaimedIntentRow = (String, i64, String, Vec<u8>, String, Option<String>);
 type GenerationRow = (String, String, String, String, String, String, Vec<u8>);
 
 use crate::{
+    lease::{lease_now, LeasedRun, RunLeaseFence, UnixMillisClock},
     pipeline::{verified_pipeline, verified_publication_gate},
     verify_run_journal, SqliteStore, StoreError,
 };
@@ -140,12 +142,30 @@ pub trait PublicationProvider {
 }
 
 impl SqliteStore {
+    #[cfg(test)]
     pub fn enqueue_publication(
         &mut self,
         push_operation_id: &OperationId,
         change_request_operation_id: &OperationId,
         authorization: &PublicationAuthorization,
         observation: &PublicationObservation,
+    ) -> Result<(), StoreError> {
+        self.enqueue_publication_inner(
+            push_operation_id,
+            change_request_operation_id,
+            authorization,
+            observation,
+            None,
+        )
+    }
+
+    fn enqueue_publication_inner(
+        &mut self,
+        push_operation_id: &OperationId,
+        change_request_operation_id: &OperationId,
+        authorization: &PublicationAuthorization,
+        observation: &PublicationObservation,
+        lease: Option<(&RunLeaseFence, &dyn UnixMillisClock)>,
     ) -> Result<(), StoreError> {
         if push_operation_id == change_request_operation_id {
             return Err(StoreError::PublicationOutboxConflict);
@@ -154,6 +174,12 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
+        if let Some((fence, clock)) = lease {
+            lease_now(&transaction, fence, clock)?;
+            if fence.run_id() != &authorization.run_id {
+                return Err(StoreError::RunLeaseRequired);
+            }
+        }
         verify_run_journal(&transaction, &authorization.run_id)?;
         let gate = verified_publication_gate(
             &transaction,
@@ -290,6 +316,25 @@ impl SqliteStore {
     }
 }
 
+impl LeasedRun<'_, '_> {
+    pub fn enqueue_publication(
+        &mut self,
+        push_operation_id: &OperationId,
+        change_request_operation_id: &OperationId,
+        authorization: &PublicationAuthorization,
+        observation: &PublicationObservation,
+    ) -> Result<(), StoreError> {
+        self.store.enqueue_publication_inner(
+            push_operation_id,
+            change_request_operation_id,
+            authorization,
+            observation,
+            Some((&self.fence, self.clock)),
+        )
+    }
+}
+
+#[cfg(test)]
 pub fn reconcile_publication(
     store: &mut SqliteStore,
     provider: &mut impl PublicationProvider,
@@ -741,6 +786,7 @@ fn verify_outbox_generations(
     Ok(())
 }
 
+#[cfg(test)]
 fn claim_next_intent(
     store: &mut SqliteStore,
     run_id: &RunId,
@@ -797,6 +843,7 @@ fn claim_next_intent(
     Ok(Some((intent, status == "EFFECT_UNKNOWN")))
 }
 
+#[cfg(test)]
 fn outbox_ordinal_completed(
     store: &SqliteStore,
     run_id: &RunId,
@@ -820,6 +867,7 @@ fn outbox_ordinal_completed(
         .map_err(StoreError::Sqlite)
 }
 
+#[cfg(test)]
 fn mark_effect_unknown(
     store: &mut SqliteStore,
     intent: &PublicationIntent,
@@ -840,6 +888,7 @@ fn mark_effect_unknown(
     Ok(())
 }
 
+#[cfg(test)]
 fn release_fresh_uncertain(
     store: &mut SqliteStore,
     intent: &PublicationIntent,
@@ -859,6 +908,7 @@ fn release_fresh_uncertain(
     Ok(())
 }
 
+#[cfg(test)]
 fn release_if_known(
     store: &mut SqliteStore,
     intent: &PublicationIntent,
@@ -872,6 +922,7 @@ fn release_if_known(
     }
 }
 
+#[cfg(test)]
 fn release_claim(
     store: &mut SqliteStore,
     intent: &PublicationIntent,
@@ -892,6 +943,7 @@ fn release_claim(
     Ok(())
 }
 
+#[cfg(test)]
 fn complete_intent<T: Serialize>(
     store: &mut SqliteStore,
     intent: &PublicationIntent,

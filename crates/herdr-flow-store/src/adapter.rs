@@ -379,6 +379,7 @@ struct DurableAgentBinding {
 }
 
 impl DurableAgentBinding {
+    #[cfg(test)]
     fn new(
         run_id: &RunId,
         stage_instance_id: &StageInstanceId,
@@ -404,6 +405,7 @@ impl DurableAgentBinding {
 }
 
 impl SqliteStore {
+    #[cfg(test)]
     pub fn persist_agent_session_binding(
         &mut self,
         run_id: &RunId,
