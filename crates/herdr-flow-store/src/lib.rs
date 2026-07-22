@@ -177,7 +177,7 @@ impl SqliteStore {
         Self::from_connection(connection)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, StoreError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
         connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(StoreError::Sqlite)?;
@@ -193,7 +193,20 @@ impl SqliteStore {
         connection
             .pragma_update(None, "trusted_schema", "OFF")
             .map_err(StoreError::Sqlite)?;
-        connection
+        let schema_transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let had_outbox_claim_fences: bool = schema_transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'publication_outbox_claim_fences'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        schema_transaction
             .execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS runs (
@@ -398,6 +411,14 @@ impl SqliteStore {
                 CREATE INDEX IF NOT EXISTS publication_outbox_pending
                     ON publication_outbox(run_id, status, ordinal);
 
+                CREATE TABLE IF NOT EXISTS publication_outbox_claim_fences (
+                    operation_id TEXT PRIMARY KEY
+                        REFERENCES publication_outbox(operation_id) ON DELETE RESTRICT,
+                    lease_epoch INTEGER NOT NULL CHECK(
+                        lease_epoch >= 0 AND lease_epoch <= 9007199254740991
+                    )
+                ) STRICT;
+
                 CREATE TABLE IF NOT EXISTS publication_outbox_generations (
                     run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
                     manifest_digest TEXT NOT NULL,
@@ -495,6 +516,17 @@ impl SqliteStore {
                 ",
             )
             .map_err(StoreError::Sqlite)?;
+        if !had_outbox_claim_fences {
+            schema_transaction
+                .execute(
+                    "INSERT INTO publication_outbox_claim_fences(operation_id, lease_epoch)
+                     SELECT operation_id, 0 FROM publication_outbox
+                     WHERE status IN ('CLAIMED', 'EFFECT_UNKNOWN')",
+                    [],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        schema_transaction.commit().map_err(StoreError::Sqlite)?;
         verify_pragmas(&connection)?;
         Ok(Self {
             connection,
