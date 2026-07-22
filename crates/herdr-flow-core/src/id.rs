@@ -10,6 +10,8 @@ pub enum IdentifierError {
     InvalidUlid,
 }
 
+impl core::error::Error for IdentifierError {}
+
 impl fmt::Display for IdentifierError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

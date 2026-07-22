@@ -2,14 +2,22 @@
 
 //! Atomic persistence adapters for Herdr Flow.
 
+mod adapter;
 mod artifact;
 mod git;
+mod human;
 mod outbox;
 mod pipeline;
 mod registry;
 
+pub use adapter::{
+    validate_m1_role_pair, AdapterContractError, AgentBindingTarget, AgentProduct,
+    AgentSessionBinding, FrozenWorktree, HerdrAgentAdapter, HerdrAgentObservation,
+    IntegrationPreflightReceipt,
+};
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
 pub use git::{GitRepository, GitRepositoryError, SnapshotRefOutcome};
+pub use human::{QueuedHumanAction, QueuedHumanActionStatus};
 pub use outbox::{
     reconcile_publication, ChangeRequestResult, PublicationIntent, PublicationIntentKind,
     PublicationIntentRecord, PublicationOutboxStatus, PublicationProvider,
@@ -135,6 +143,11 @@ pub enum StoreError {
     PublicationOutboxConflict,
     PublicationOutboxNotReady,
     PublicationProvider(outbox::PublicationProviderError),
+    HumanActionConflict,
+    HumanActionNotFound,
+    AdapterContract(AdapterContractError),
+    AgentBindingConflict,
+    AgentBindingNotFound,
 }
 
 impl SqliteStore {
@@ -220,6 +233,35 @@ impl SqliteStore {
 
                 CREATE INDEX IF NOT EXISTS publication_gate_events_run_sequence
                     ON publication_gate_events(run_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS agent_session_bindings (
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    stage_instance_id TEXT NOT NULL,
+                    role_slot TEXT NOT NULL,
+                    record_digest TEXT NOT NULL,
+                    record_json BLOB NOT NULL,
+                    PRIMARY KEY(run_id, stage_instance_id, role_slot),
+                    FOREIGN KEY(stage_instance_id, run_id)
+                        REFERENCES stage_snapshots(stage_instance_id, run_id)
+                        ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS human_action_inbox (
+                    message_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    gate_stage_instance_id TEXT NOT NULL,
+                    command_digest TEXT NOT NULL,
+                    message_digest TEXT NOT NULL,
+                    command_json BLOB NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PENDING', 'COMMITTED')),
+                    UNIQUE(run_id, gate_stage_instance_id, command_digest),
+                    FOREIGN KEY(gate_stage_instance_id, run_id)
+                        REFERENCES publication_gate_snapshots(stage_instance_id, run_id)
+                        ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE INDEX IF NOT EXISTS human_action_inbox_pending
+                    ON human_action_inbox(run_id, status, message_id);
 
                 CREATE TABLE IF NOT EXISTS publication_outbox (
                     operation_id TEXT PRIMARY KEY,
@@ -1142,6 +1184,13 @@ impl fmt::Display for StoreError {
                 formatter.write_str("publication outbox dependency is not complete")
             }
             Self::PublicationProvider(error) => error.fmt(formatter),
+            Self::HumanActionConflict => formatter.write_str("human action conflicts with inbox"),
+            Self::HumanActionNotFound => formatter.write_str("human action was not found"),
+            Self::AdapterContract(error) => write!(formatter, "adapter contract error: {error:?}"),
+            Self::AgentBindingConflict => {
+                formatter.write_str("agent binding conflicts with durable assignment")
+            }
+            Self::AgentBindingNotFound => formatter.write_str("agent binding was not found"),
         }
     }
 }

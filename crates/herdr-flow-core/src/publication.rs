@@ -149,7 +149,7 @@ pub struct PublicationGateState {
     pub invalidation_digest: Option<Sha256Digest>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PublicationGateCommand {
     BindReviewInput {
         expected_control_revision: u64,

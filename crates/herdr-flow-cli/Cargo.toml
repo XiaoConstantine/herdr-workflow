@@ -14,3 +14,4 @@ path = "src/main.rs"
 clap.workspace = true
 herdr-flow-core = { path = "../herdr-flow-core" }
 herdr-flow-store = { path = "../herdr-flow-store" }
+serde_json = { workspace = true, features = ["std"] }

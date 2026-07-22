@@ -477,6 +477,7 @@ impl SqliteStore {
         }
 
         for entry in batch.publication_gate_entries {
+            crate::human::commit_matching_action(&transaction, entry)?;
             let state = verified_publication_gate(
                 &transaction,
                 batch.run_id,
@@ -1522,6 +1523,32 @@ pub(crate) fn verified_publication_gate(
             .map_err(StoreError::Identifier)?;
         let event = publication_gate_event_by_message_id(connection, &message_id)?
             .ok_or(StoreError::PartialSemanticBatch)?;
+        if matches!(
+            event.event.kind,
+            PublicationGateEventKind::HumanApproved { .. }
+                | PublicationGateEventKind::HumanRequestedChanges { .. }
+                | PublicationGateEventKind::HumanCancelled { .. }
+        ) {
+            let action = crate::human::load_action(connection, &message_id)?
+                .ok_or(StoreError::PartialSemanticBatch)?;
+            if action.status != crate::QueuedHumanActionStatus::Committed
+                || action.message_digest != event.message_digest
+                || action.run_id != event.run_id
+                || action.gate_stage_instance_id != event.stage_instance_id
+            {
+                return Err(StoreError::CorruptData(
+                    "committed human event does not match its authoritative inbox message",
+                ));
+            }
+            let derived = replayed
+                .decide(action.command)
+                .map_err(StoreError::PublicationGateTransition)?;
+            if derived != event.event {
+                return Err(StoreError::CorruptData(
+                    "committed human event was not derived from its inbox command",
+                ));
+            }
+        }
         replayed = replayed
             .apply(&event.event)
             .map_err(StoreError::PublicationGateTransition)?;

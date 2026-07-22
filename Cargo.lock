@@ -264,6 +264,7 @@ dependencies = [
  "clap",
  "herdr-flow-core",
  "herdr-flow-store",
+ "serde_json",
 ]
 
 [[package]]

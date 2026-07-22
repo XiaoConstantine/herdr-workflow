@@ -42,6 +42,8 @@ impl fmt::Display for Sha256Digest {
     }
 }
 
+impl core::error::Error for DigestParseError {}
+
 impl fmt::Display for DigestParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
