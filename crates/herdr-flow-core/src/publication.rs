@@ -15,6 +15,13 @@ pub enum TargetDriftPolicy {
     HumanAuthorizedAlternative { policy_digest: Sha256Digest },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublicationReviewOutcome {
+    AgentAligned,
+    HumanOverride,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PublicationManifest {
     pub run_id: RunId,
@@ -36,6 +43,9 @@ pub struct PublicationManifest {
     pub pipeline_definition_digest: Sha256Digest,
     pub requirements_digest: Sha256Digest,
     pub review_package_digest: Sha256Digest,
+    pub reviewed_object: GitObjectId,
+    pub review_outcome: PublicationReviewOutcome,
+    pub review_override_authorization_digest: Option<Sha256Digest>,
     pub gate_input_manifest_digest: Sha256Digest,
     pub check_policy_digest: Sha256Digest,
     pub check_result_digest: Sha256Digest,
@@ -612,6 +622,9 @@ mod tests {
             pipeline_definition_digest: digest(6),
             requirements_digest: digest(7),
             review_package_digest: digest(8),
+            reviewed_object: oid('2'),
+            review_outcome: PublicationReviewOutcome::AgentAligned,
+            review_override_authorization_digest: None,
             gate_input_manifest_digest: digest(15),
             check_policy_digest: digest(9),
             check_result_digest: digest(10),

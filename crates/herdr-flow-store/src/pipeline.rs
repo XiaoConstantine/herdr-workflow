@@ -198,6 +198,7 @@ impl SqliteStore {
         &mut self,
         run_id: &RunId,
         state: &PipelineState,
+        review: &crate::AdversarialReviewRegistration,
         gate: &PublicationGateState,
     ) -> Result<(), StoreError> {
         if !state.is_pristine() {
@@ -212,6 +213,15 @@ impl SqliteStore {
             return Err(StoreError::InvalidInitialPublicationGate);
         }
         validate_gate_registration(state, gate)?;
+        if review.stage_instance_id != gate.expected_review_stage_instance_id
+            || review.evidence_producer_stage_instance_id != review.stage_instance_id
+            || review.validate().is_err()
+            || state
+                .node_definition(&review.evidence_producer_stage_instance_id)
+                .is_none_or(|node| node.stage.component_digest != review.evidence_component_digest)
+        {
+            return Err(StoreError::InvalidInitialAdversarialReview);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -268,6 +278,7 @@ impl SqliteStore {
                 params![run_id.as_str(), pipeline_json],
             )
             .map_err(StoreError::Sqlite)?;
+        crate::review::insert_adversarial_review_registration(&transaction, run_id, review)?;
         let gate_json = serde_json::to_vec(gate).map_err(StoreError::Serialization)?;
         transaction
             .execute(
@@ -357,6 +368,11 @@ impl SqliteStore {
         {
             return Err(StoreError::M1PublicationGateAtomicity);
         }
+        let manifest = gate
+            .manifest
+            .as_ref()
+            .ok_or(StoreError::M1PublicationGateAtomicity)?;
+        validate_current_review_manifest(&transaction, &gate, manifest)?;
         gate.validate_pre_side_effect(authorization, observation, kind)
             .map_err(StoreError::PublicationGateTransition)?;
         transaction.commit().map_err(StoreError::Sqlite)
@@ -522,6 +538,20 @@ impl SqliteStore {
                 .apply(entry.event)
                 .map_err(StoreError::PipelineTransition)?;
             validate_pipeline_artifact_acceptance(&transaction, batch.run_id, entry.event)?;
+            if let PipelineEventKind::StageScheduled {
+                stage_event,
+                input_manifest,
+            } = &entry.event.kind
+            {
+                crate::review::bind_scheduled_adversarial_review(
+                    &transaction,
+                    batch.run_id,
+                    &stage_event.stage_instance_id,
+                    input_manifest
+                        .digest()
+                        .map_err(StoreError::Canonicalization)?,
+                )?;
+            }
             insert_pipeline_event(&transaction, batch.run_id, sequence, entry)?;
             pipeline_state = next_state;
             sequence += 1;
@@ -761,6 +791,7 @@ fn semantic_batch_is_duplicate(
             || event_by_message_id(transaction, &stage.message_id)?.is_some()
             || pipeline_message_id_exists(transaction, &stage.message_id)?
             || publication_gate_event_by_message_id(transaction, &stage.message_id)?.is_some()
+            || crate::review::review_message_id_exists(transaction, &stage.message_id)?
         {
             return Err(StoreError::PartialSemanticBatch);
         }
@@ -770,6 +801,7 @@ fn semantic_batch_is_duplicate(
             || event_by_message_id(transaction, &gate.message_id)?.is_some()
             || pipeline_event_by_message_id(transaction, &gate.message_id)?.is_some()
             || publication_gate_event_by_message_id(transaction, &gate.message_id)?.is_some()
+            || crate::review::review_message_id_exists(transaction, &gate.message_id)?
         {
             return Err(StoreError::PartialSemanticBatch);
         }
@@ -779,6 +811,7 @@ fn semantic_batch_is_duplicate(
             || event_by_message_id(transaction, &pipeline.message_id)?.is_some()
             || pipeline_event_by_message_id(transaction, &pipeline.message_id)?.is_some()
             || publication_gate_event_by_message_id(transaction, &pipeline.message_id)?.is_some()
+            || crate::review::review_message_id_exists(transaction, &pipeline.message_id)?
         {
             return Err(StoreError::PartialSemanticBatch);
         }
@@ -1128,6 +1161,52 @@ fn validate_registered_m1_batch(
     Ok(())
 }
 
+fn validate_current_review_manifest(
+    connection: &Connection,
+    gate: &PublicationGateState,
+    manifest: &herdr_flow_core::PublicationManifest,
+) -> Result<(), StoreError> {
+    let review = crate::review::verified_adversarial_review(
+        connection,
+        &gate.run_id,
+        &gate.expected_review_stage_instance_id,
+    )?;
+    let candidate = review
+        .candidate
+        .as_ref()
+        .ok_or(StoreError::M1PublicationGateAtomicity)?;
+    let registration = crate::review::load_registration(
+        connection,
+        &gate.run_id,
+        &gate.expected_review_stage_instance_id,
+    )?
+    .ok_or(StoreError::M1PublicationGateAtomicity)?;
+    let outcome_matches = match review.phase {
+        herdr_flow_core::ReviewPhase::Aligned => {
+            manifest.review_outcome == herdr_flow_core::PublicationReviewOutcome::AgentAligned
+                && manifest.review_override_authorization_digest.is_none()
+                && review.aligned_package_digest == Some(manifest.review_package_digest)
+        }
+        herdr_flow_core::ReviewPhase::HumanOverride => {
+            manifest.review_outcome == herdr_flow_core::PublicationReviewOutcome::HumanOverride
+                && manifest.review_override_authorization_digest
+                    == review.override_authorization_digest
+                && review.override_package_digest == Some(manifest.review_package_digest)
+        }
+        _ => false,
+    };
+    if !outcome_matches
+        || manifest.reviewed_object != candidate.object
+        || manifest.final_object != candidate.object
+        || manifest.frozen_review_state_revision != review.review_state_revision
+        || manifest.check_policy_digest != registration.check_policy_digest
+        || manifest.check_result_digest != candidate.check_result_digest
+    {
+        return Err(StoreError::M1PublicationGateAtomicity);
+    }
+    Ok(())
+}
+
 fn validate_m1_publication_gate_entry(
     connection: &Connection,
     batch: &SemanticBatch<'_>,
@@ -1203,7 +1282,62 @@ fn validate_m1_publication_gate_entry(
                         commitment.artifact_id == review.record.artifact_id
                             && commitment.record_digest == review.record_digest
                     });
-            if review.record.sha256 != *review_package_digest
+            let review_state = crate::review::verified_adversarial_review(
+                connection,
+                &next.run_id,
+                &next.expected_review_stage_instance_id,
+            )?;
+            let evidence_ids: (String, String, String) = connection
+                .query_row(
+                    "SELECT object_manifest_artifact_id, validation_artifact_id,
+                            check_result_artifact_id
+                     FROM adversarial_review_candidates
+                     WHERE run_id = ?1 AND stage_instance_id = ?2
+                     ORDER BY epoch DESC LIMIT 1",
+                    params![
+                        next.run_id.as_str(),
+                        next.expected_review_stage_instance_id.as_str()
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(StoreError::Sqlite)?;
+            let evidence_ids = [
+                herdr_flow_core::ArtifactId::from_str(&evidence_ids.0)
+                    .map_err(StoreError::Identifier)?,
+                herdr_flow_core::ArtifactId::from_str(&evidence_ids.1)
+                    .map_err(StoreError::Identifier)?,
+                herdr_flow_core::ArtifactId::from_str(&evidence_ids.2)
+                    .map_err(StoreError::Identifier)?,
+            ];
+            let pipeline = verified_pipeline(connection, &next.run_id)?;
+            for evidence_id in &evidence_ids {
+                let is_parent: bool = connection
+                    .query_row(
+                        "SELECT 1 FROM artifact_edges
+                         WHERE run_id = ?1 AND parent_artifact_id = ?2
+                           AND child_artifact_id = ?3",
+                        params![
+                            next.run_id.as_str(),
+                            evidence_id.as_str(),
+                            review_package_artifact_id.as_str()
+                        ],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(StoreError::Sqlite)?
+                    .unwrap_or_default();
+                if !pipeline.artifact_is_valid(evidence_id) || !is_parent {
+                    return Err(StoreError::M1PublicationGateAtomicity);
+                }
+            }
+            let authorized_review_digest = match review_state.phase {
+                herdr_flow_core::ReviewPhase::Aligned => review_state.aligned_package_digest,
+                herdr_flow_core::ReviewPhase::HumanOverride => review_state.override_package_digest,
+                _ => None,
+            };
+            if review_state.input_manifest_digest != review.record.input_manifest_digest
+                || authorized_review_digest != Some(*review_package_digest)
+                || review.record.sha256 != *review_package_digest
                 || review.record.artifact_type != "review-package/v1"
                 || review.record.producer_attempt == 0
                 || review.record.producer_stage_instance_id
@@ -1215,6 +1349,11 @@ fn validate_m1_publication_gate_entry(
             }
         }
         PublicationGateEventKind::HumanApproved { .. } => {
+            let manifest = next
+                .manifest
+                .as_ref()
+                .ok_or(StoreError::M1PublicationGateAtomicity)?;
+            validate_current_review_manifest(connection, next, manifest)?;
             let authorization = next
                 .authorization()
                 .map_err(StoreError::PublicationGateTransition)?;
@@ -1313,8 +1452,51 @@ fn validate_m1_publication_gate_entry(
                 return Err(StoreError::M1PublicationGateAtomicity);
             }
         }
-        PublicationGateEventKind::ManifestPresented { .. }
-        | PublicationGateEventKind::HumanRequestedChanges { .. }
+        PublicationGateEventKind::ManifestPresented { manifest, .. } => {
+            let review_state = crate::review::verified_adversarial_review(
+                connection,
+                &next.run_id,
+                &next.expected_review_stage_instance_id,
+            )?;
+            let candidate = review_state
+                .candidate
+                .as_ref()
+                .ok_or(StoreError::M1PublicationGateAtomicity)?;
+            let outcome_matches = match review_state.phase {
+                herdr_flow_core::ReviewPhase::Aligned => {
+                    manifest.review_outcome
+                        == herdr_flow_core::PublicationReviewOutcome::AgentAligned
+                        && manifest.review_override_authorization_digest.is_none()
+                        && review_state.aligned_package_digest
+                            == Some(manifest.review_package_digest)
+                }
+                herdr_flow_core::ReviewPhase::HumanOverride => {
+                    manifest.review_outcome
+                        == herdr_flow_core::PublicationReviewOutcome::HumanOverride
+                        && manifest.review_override_authorization_digest
+                            == review_state.override_authorization_digest
+                        && review_state.override_package_digest
+                            == Some(manifest.review_package_digest)
+                }
+                _ => false,
+            };
+            let review_registration = crate::review::load_registration(
+                connection,
+                &next.run_id,
+                &next.expected_review_stage_instance_id,
+            )?
+            .ok_or(StoreError::M1PublicationGateAtomicity)?;
+            if !outcome_matches
+                || manifest.check_policy_digest != review_registration.check_policy_digest
+                || manifest.check_result_digest != candidate.check_result_digest
+                || manifest.reviewed_object != candidate.object
+                || manifest.final_object != candidate.object
+                || manifest.frozen_review_state_revision != review_state.review_state_revision
+            {
+                return Err(StoreError::M1PublicationGateAtomicity);
+            }
+        }
+        PublicationGateEventKind::HumanRequestedChanges { .. }
         | PublicationGateEventKind::HumanCancelled { .. } => {}
     }
     Ok(())
@@ -1793,8 +1975,9 @@ pub(crate) fn pipeline_snapshot_exists(
 #[cfg(test)]
 mod tests {
     use herdr_flow_core::{
-        ArtifactId, ArtifactRecord, PipelineCommand, PipelineNodeDefinition,
-        PublicationGateRegistration, StageCommand, StageInstanceId, StageState,
+        ArtifactId, ArtifactRecord, GitObjectFormat, GitObjectId, ParticipantPrincipalId,
+        PipelineCommand, PipelineNodeDefinition, PublicationGateRegistration, StageCommand,
+        StageInstanceId, StageState,
     };
     use tempfile::TempDir;
 
@@ -2187,6 +2370,18 @@ mod tests {
         store
             .create_run(&run_id, &pipeline.definition_digest)
             .unwrap();
+        let review = crate::AdversarialReviewRegistration {
+            stage_instance_id: review_id.clone(),
+            implementer: ParticipantPrincipalId::parse("principal_01ARZ3NDEKTSV4RRFFQ69G5FB2")
+                .unwrap(),
+            reviewers: vec![
+                ParticipantPrincipalId::parse("principal_01ARZ3NDEKTSV4RRFFQ69G5FB3").unwrap(),
+            ],
+            baseline: GitObjectId::from_hex(GitObjectFormat::Sha1, &"1".repeat(40)).unwrap(),
+            evidence_producer_stage_instance_id: review_id.clone(),
+            evidence_component_digest: digest(b"review-component"),
+            check_policy_digest: digest(b"check-policy"),
+        };
         let gate = PublicationGateState::new(PublicationGateRegistration {
             run_id: run_id.clone(),
             stage_instance_id: gate_id.clone(),
@@ -2202,7 +2397,7 @@ mod tests {
             gate_component_digest: digest(b"gate-component"),
         });
         store
-            .register_m1_pipeline(&run_id, &pipeline, &gate)
+            .register_m1_pipeline(&run_id, &pipeline, &review, &gate)
             .unwrap();
         assert_eq!(
             store

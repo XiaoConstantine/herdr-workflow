@@ -25,8 +25,10 @@ mod stage;
 pub use adversarial_review::{
     replay_adversarial_review, AdversarialReviewCommand, AdversarialReviewError,
     AdversarialReviewEvent, AdversarialReviewEventKind, AdversarialReviewState, FindingDisposition,
-    FindingSeverity, FindingStatus, ReviewCandidate, ReviewDecision, ReviewFinding, ReviewPhase,
-    ReviewerFindingAction, ReviewerSlot,
+    FindingSeverity, FindingStatus, ImplementationCandidateArtifact, ReviewCandidate,
+    ReviewCandidateArtifact, ReviewCandidateCheckResult, ReviewCandidateObjectManifest,
+    ReviewCandidateValidation, ReviewDecision, ReviewFinding, ReviewPhase, ReviewerFindingAction,
+    ReviewerSlot,
 };
 pub use artifact::{
     ArtifactCatalog, ArtifactCatalogError, ArtifactRecord, ArtifactRecordValidationError,
@@ -56,7 +58,7 @@ pub use publication::{
     replay_publication_gate, PublicationAuthorization, PublicationFeedbackTarget,
     PublicationGateCommand, PublicationGateError, PublicationGateEvent, PublicationGateEventKind,
     PublicationGatePhase, PublicationGateRegistration, PublicationGateState, PublicationManifest,
-    PublicationObservation, PublicationSideEffectKind, TargetDriftPolicy,
+    PublicationObservation, PublicationReviewOutcome, PublicationSideEffectKind, TargetDriftPolicy,
 };
 pub use stage::{
     replay_stage, StageCommand, StageEvent, StageEventKind, StagePhase, StageState,

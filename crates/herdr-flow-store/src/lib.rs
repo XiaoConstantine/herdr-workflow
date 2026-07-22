@@ -9,6 +9,7 @@ mod human;
 mod outbox;
 mod pipeline;
 mod registry;
+mod review;
 
 pub use adapter::{
     validate_m1_role_pair, AdapterContractError, AgentBindingTarget, AgentProduct,
@@ -28,6 +29,10 @@ pub use pipeline::{
     SemanticStageEntry,
 };
 pub use registry::{ArtifactRegistration, StoredArtifactRecord};
+pub use review::{
+    AdversarialReviewRegistration, AdversarialReviewSubmission, AppendAdversarialReviewOutcome,
+    ReviewCandidateEvidence, StoredAdversarialReviewEvent,
+};
 
 use std::{fmt, path::Path, str::FromStr, time::Duration};
 
@@ -134,6 +139,13 @@ pub enum StoreError {
     PartialSemanticBatch,
     PipelineSemanticCommitRequired,
     SemanticBatchConflict,
+    AdversarialReviewAlreadyExists,
+    AdversarialReviewNotFound,
+    InvalidInitialAdversarialReview,
+    AdversarialReviewTransition(herdr_flow_core::AdversarialReviewError),
+    AdversarialReviewAuthorityMismatch,
+    AdversarialReviewCandidateMismatch,
+    AdversarialReviewGit(GitRepositoryError),
     PublicationGateAlreadyExists,
     PublicationGateNotFound,
     InvalidInitialPublicationGate,
@@ -201,6 +213,74 @@ impl SqliteStore {
                         CHECK(control_revision >= 0 AND control_revision <= 9007199254740991),
                     initial_state_json BLOB NOT NULL,
                     state_json BLOB NOT NULL
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS adversarial_review_registrations (
+                    stage_instance_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    registration_digest TEXT NOT NULL,
+                    registration_json BLOB NOT NULL,
+                    PRIMARY KEY(stage_instance_id, run_id),
+                    FOREIGN KEY(stage_instance_id, run_id)
+                        REFERENCES stage_snapshots(stage_instance_id, run_id)
+                        ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS adversarial_review_snapshots (
+                    stage_instance_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    control_revision INTEGER NOT NULL
+                        CHECK(control_revision >= 0 AND control_revision <= 9007199254740991),
+                    review_state_revision INTEGER NOT NULL
+                        CHECK(review_state_revision >= 0 AND review_state_revision <= 9007199254740991),
+                    initial_state_json BLOB NOT NULL,
+                    state_json BLOB NOT NULL,
+                    PRIMARY KEY(stage_instance_id, run_id),
+                    FOREIGN KEY(stage_instance_id, run_id)
+                        REFERENCES stage_snapshots(stage_instance_id, run_id)
+                        ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS adversarial_review_events (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    sequence INTEGER NOT NULL
+                        CHECK(sequence >= 0 AND sequence <= 9007199254740991),
+                    message_id TEXT NOT NULL UNIQUE,
+                    message_digest TEXT NOT NULL,
+                    stage_instance_id TEXT NOT NULL,
+                    event_digest TEXT NOT NULL,
+                    event_json BLOB NOT NULL,
+                    UNIQUE(run_id, sequence),
+                    FOREIGN KEY(stage_instance_id, run_id)
+                        REFERENCES adversarial_review_snapshots(stage_instance_id, run_id)
+                        ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE INDEX IF NOT EXISTS adversarial_review_events_run_sequence
+                    ON adversarial_review_events(run_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS adversarial_review_candidates (
+                    message_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    stage_instance_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL CHECK(epoch > 0),
+                    bytes_digest TEXT NOT NULL,
+                    parent_bytes_digest TEXT,
+                    object_manifest_artifact_id TEXT,
+                    validation_artifact_id TEXT,
+                    check_result_artifact_id TEXT,
+                    FOREIGN KEY(message_id) REFERENCES adversarial_review_events(message_id)
+                        ON DELETE RESTRICT,
+                    FOREIGN KEY(stage_instance_id, run_id)
+                        REFERENCES adversarial_review_snapshots(stage_instance_id, run_id)
+                        ON DELETE RESTRICT,
+                    FOREIGN KEY(object_manifest_artifact_id, run_id)
+                        REFERENCES artifacts(artifact_id, run_id) ON DELETE RESTRICT,
+                    FOREIGN KEY(validation_artifact_id, run_id)
+                        REFERENCES artifacts(artifact_id, run_id) ON DELETE RESTRICT,
+                    FOREIGN KEY(check_result_artifact_id, run_id)
+                        REFERENCES artifacts(artifact_id, run_id) ON DELETE RESTRICT
                 ) STRICT;
 
                 CREATE TABLE IF NOT EXISTS publication_gate_snapshots (
@@ -742,6 +822,7 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         verify_run_journal(&transaction, run_id)?;
         let records = registry::load_and_verify_run_artifacts(&transaction, run_id)?;
+        review::verify_adversarial_review_candidate_bytes(&transaction, run_id, artifact_store)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         registry::verify_artifact_bytes(artifact_store, &records)?;
         Ok(records)
@@ -926,6 +1007,9 @@ fn verify_run_journal(connection: &Connection, run_id: &RunId) -> Result<(), Sto
     sequences.extend(pipeline::verify_publication_gate_journal(
         connection, run_id,
     )?);
+    sequences.extend(review::verify_adversarial_review_journal(
+        connection, run_id,
+    )?);
     let (entry_count, distinct_event_ids, distinct_message_ids): (i64, i64, i64) = connection
         .query_row(
             "SELECT COUNT(*), COUNT(DISTINCT event_id), COUNT(DISTINCT message_id)
@@ -935,6 +1019,8 @@ fn verify_run_journal(connection: &Connection, run_id: &RunId) -> Result<(), Sto
                 SELECT event_id, message_id FROM pipeline_events WHERE run_id = ?1
                 UNION ALL
                 SELECT event_id, message_id FROM publication_gate_events WHERE run_id = ?1
+                UNION ALL
+                SELECT event_id, message_id FROM adversarial_review_events WHERE run_id = ?1
              )",
             params![run_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1074,6 +1160,8 @@ fn event_id_exists(transaction: &Transaction<'_>, event_id: &EventId) -> Result<
                 SELECT event_id FROM pipeline_events WHERE event_id = ?1
                 UNION ALL
                 SELECT event_id FROM publication_gate_events WHERE event_id = ?1
+                UNION ALL
+                SELECT event_id FROM adversarial_review_events WHERE event_id = ?1
              ) LIMIT 1",
             params![event_id.as_str()],
             |_| Ok(true),
@@ -1165,6 +1253,22 @@ impl fmt::Display for StoreError {
             Self::SemanticBatchConflict => {
                 formatter.write_str("semantic batch ID was reused with different content")
             }
+            Self::AdversarialReviewAlreadyExists => {
+                formatter.write_str("adversarial review is already registered")
+            }
+            Self::AdversarialReviewNotFound => {
+                formatter.write_str("adversarial review was not found")
+            }
+            Self::InvalidInitialAdversarialReview => {
+                formatter.write_str("adversarial review initial state is not pristine")
+            }
+            Self::AdversarialReviewTransition(error) => error.fmt(formatter),
+            Self::AdversarialReviewAuthorityMismatch => {
+                formatter.write_str("adversarial review command authority does not match its role")
+            }
+            Self::AdversarialReviewCandidateMismatch => formatter
+                .write_str("adversarial review candidate does not match its scheduled input"),
+            Self::AdversarialReviewGit(error) => error.fmt(formatter),
             Self::PublicationGateAlreadyExists => {
                 formatter.write_str("publication gate is already registered")
             }

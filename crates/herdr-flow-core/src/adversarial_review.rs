@@ -77,8 +77,61 @@ pub struct ReviewerSlot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewCandidateObjectManifest {
+    pub object: GitObjectId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewCandidateValidation {
+    pub object: GitObjectId,
+    pub prior_object: GitObjectId,
+    pub candidate_manifest_digest: Sha256Digest,
+    pub valid: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewCandidateCheckResult {
+    pub object: GitObjectId,
+    pub candidate_manifest_digest: Sha256Digest,
+    pub check_policy_digest: Sha256Digest,
+    pub passed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ImplementationCandidateArtifact {
+    pub object: GitObjectId,
+    pub candidate_manifest_digest: Sha256Digest,
+}
+
+impl ImplementationCandidateArtifact {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, AdversarialReviewError> {
+        let value = serde_json::to_value(self)
+            .map_err(|_| AdversarialReviewError::CommitmentSerialization)?;
+        canonical_json::to_vec(&value).map_err(|_| AdversarialReviewError::CommitmentSerialization)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewCandidateArtifact {
+    pub object: GitObjectId,
+    pub evidence_commitment_digest: Sha256Digest,
+    pub candidate_manifest_digest: Sha256Digest,
+    pub validation_digest: Sha256Digest,
+    pub check_result_digest: Sha256Digest,
+}
+
+impl ReviewCandidateArtifact {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, AdversarialReviewError> {
+        let value = serde_json::to_value(self)
+            .map_err(|_| AdversarialReviewError::CommitmentSerialization)?;
+        canonical_json::to_vec(&value).map_err(|_| AdversarialReviewError::CommitmentSerialization)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ReviewCandidate {
     pub object: GitObjectId,
+    pub evidence_commitment_digest: Sha256Digest,
     pub candidate_manifest_digest: Sha256Digest,
     pub validation_digest: Sha256Digest,
     pub check_result_digest: Sha256Digest,
@@ -173,6 +226,7 @@ pub enum AdversarialReviewCommand {
     AcceptCandidate {
         expected_control_revision: u64,
         object: GitObjectId,
+        evidence_commitment_digest: Sha256Digest,
         candidate_manifest_digest: Sha256Digest,
         validation_digest: Sha256Digest,
         check_result_digest: Sha256Digest,
@@ -209,6 +263,7 @@ pub enum AdversarialReviewEventKind {
     CandidateAccepted {
         prior_control_revision: u64,
         object: GitObjectId,
+        evidence_commitment_digest: Sha256Digest,
         candidate_manifest_digest: Sha256Digest,
         validation_digest: Sha256Digest,
         check_result_digest: Sha256Digest,
@@ -319,6 +374,23 @@ impl AdversarialReviewState {
         })
     }
 
+    pub fn validate_pristine(&self) -> Result<(), AdversarialReviewError> {
+        let reconstructed = Self::new(
+            self.stage_instance_id.clone(),
+            self.implementer.clone(),
+            self.reviewers
+                .iter()
+                .map(|slot| slot.principal.clone())
+                .collect(),
+            self.input_manifest_digest,
+            self.baseline.clone(),
+        )?;
+        if *self != reconstructed {
+            return Err(AdversarialReviewError::InvalidPhase);
+        }
+        Ok(())
+    }
+
     pub fn decide(
         &self,
         command: AdversarialReviewCommand,
@@ -327,6 +399,7 @@ impl AdversarialReviewState {
             AdversarialReviewCommand::AcceptCandidate {
                 expected_control_revision,
                 object,
+                evidence_commitment_digest,
                 candidate_manifest_digest,
                 validation_digest,
                 check_result_digest,
@@ -334,6 +407,7 @@ impl AdversarialReviewState {
             } => AdversarialReviewEventKind::CandidateAccepted {
                 prior_control_revision: expected_control_revision,
                 object,
+                evidence_commitment_digest,
                 candidate_manifest_digest,
                 validation_digest,
                 check_result_digest,
@@ -391,6 +465,7 @@ impl AdversarialReviewState {
             AdversarialReviewEventKind::CandidateAccepted {
                 prior_control_revision,
                 object,
+                evidence_commitment_digest,
                 candidate_manifest_digest,
                 validation_digest,
                 check_result_digest,
@@ -402,20 +477,30 @@ impl AdversarialReviewState {
                         actual: self.control_revision,
                     });
                 }
+                let evidence_revalidation = self.candidate.as_ref().is_some_and(|current| {
+                    current.object == *object
+                        && (current.evidence_commitment_digest != *evidence_commitment_digest
+                            || current.candidate_manifest_digest != *candidate_manifest_digest
+                            || current.validation_digest != *validation_digest
+                            || current.check_result_digest != *check_result_digest)
+                });
                 if !matches!(
                     self.phase,
                     ReviewPhase::AwaitingCandidate | ReviewPhase::CorrectionRequired
-                ) {
+                ) && !(evidence_revalidation && self.phase == ReviewPhase::Reviewing)
+                {
                     return Err(AdversarialReviewError::InvalidPhase);
                 }
                 if object.format() != self.baseline.format() {
                     return Err(AdversarialReviewError::CandidateMustDescendFromBaseline);
                 }
-                if self
-                    .candidate
-                    .as_ref()
-                    .is_some_and(|current| current.object == *object)
-                {
+                if self.candidate.as_ref().is_some_and(|current| {
+                    current.object == *object
+                        && current.evidence_commitment_digest == *evidence_commitment_digest
+                        && current.candidate_manifest_digest == *candidate_manifest_digest
+                        && current.validation_digest == *validation_digest
+                        && current.check_result_digest == *check_result_digest
+                }) {
                     return Err(AdversarialReviewError::CandidateUnchanged);
                 }
                 next.apply_dispositions(dispositions, object)?;
@@ -428,6 +513,7 @@ impl AdversarialReviewState {
                 };
                 next.candidate = Some(ReviewCandidate {
                     object: object.clone(),
+                    evidence_commitment_digest: *evidence_commitment_digest,
                     candidate_manifest_digest: *candidate_manifest_digest,
                     validation_digest: *validation_digest,
                     check_result_digest: *check_result_digest,
@@ -837,6 +923,7 @@ mod tests {
             .decide(AdversarialReviewCommand::AcceptCandidate {
                 expected_control_revision: state.control_revision,
                 object,
+                evidence_commitment_digest: digest(20),
                 candidate_manifest_digest: digest(2),
                 validation_digest: digest(3),
                 check_result_digest: digest(4),
