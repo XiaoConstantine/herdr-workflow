@@ -10,7 +10,8 @@ mod registry;
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
 pub use git::{GitRepository, GitRepositoryError, SnapshotRefOutcome};
 pub use pipeline::{
-    SemanticBatch, SemanticCommitOutcome, SemanticPipelineEntry, SemanticStageEntry,
+    SemanticBatch, SemanticCommitOutcome, SemanticPipelineEntry, SemanticPublicationGateEntry,
+    SemanticStageEntry,
 };
 pub use registry::{ArtifactRegistration, StoredArtifactRecord};
 
@@ -119,6 +120,12 @@ pub enum StoreError {
     PartialSemanticBatch,
     PipelineSemanticCommitRequired,
     SemanticBatchConflict,
+    PublicationGateAlreadyExists,
+    PublicationGateNotFound,
+    InvalidInitialPublicationGate,
+    PublicationGateTransition(herdr_flow_core::PublicationGateError),
+    M1PublicationPredicate(herdr_flow_core::M1PublicationPredicateError),
+    M1PublicationGateAtomicity,
 }
 
 impl SqliteStore {
@@ -173,6 +180,37 @@ impl SqliteStore {
                     initial_state_json BLOB NOT NULL,
                     state_json BLOB NOT NULL
                 ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS publication_gate_snapshots (
+                    stage_instance_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    control_revision INTEGER NOT NULL
+                        CHECK(control_revision >= 0 AND control_revision <= 9007199254740991),
+                    initial_state_json BLOB NOT NULL,
+                    state_json BLOB NOT NULL,
+                    UNIQUE(stage_instance_id, run_id)
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS publication_gate_events (
+                    event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    sequence INTEGER NOT NULL
+                        CHECK(sequence >= 1 AND sequence <= 9007199254740991),
+                    message_id TEXT NOT NULL UNIQUE,
+                    message_digest TEXT NOT NULL,
+                    stage_instance_id TEXT NOT NULL,
+                    prior_control_revision INTEGER NOT NULL
+                        CHECK(prior_control_revision >= 0 AND prior_control_revision <= 9007199254740991),
+                    event_digest TEXT NOT NULL,
+                    event_json BLOB NOT NULL,
+                    UNIQUE(run_id, sequence),
+                    FOREIGN KEY(stage_instance_id, run_id)
+                        REFERENCES publication_gate_snapshots(stage_instance_id, run_id)
+                        ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE INDEX IF NOT EXISTS publication_gate_events_run_sequence
+                    ON publication_gate_events(run_id, sequence);
 
                 CREATE TABLE IF NOT EXISTS pipeline_events (
                     event_id TEXT PRIMARY KEY,
@@ -793,6 +831,9 @@ fn verify_run_journal(connection: &Connection, run_id: &RunId) -> Result<(), Sto
     }
     drop(statement);
     sequences.extend(pipeline::verify_pipeline_journal(connection, run_id)?);
+    sequences.extend(pipeline::verify_publication_gate_journal(
+        connection, run_id,
+    )?);
     let (entry_count, distinct_event_ids, distinct_message_ids): (i64, i64, i64) = connection
         .query_row(
             "SELECT COUNT(*), COUNT(DISTINCT event_id), COUNT(DISTINCT message_id)
@@ -800,6 +841,8 @@ fn verify_run_journal(connection: &Connection, run_id: &RunId) -> Result<(), Sto
                 SELECT event_id, message_id FROM events WHERE run_id = ?1
                 UNION ALL
                 SELECT event_id, message_id FROM pipeline_events WHERE run_id = ?1
+                UNION ALL
+                SELECT event_id, message_id FROM publication_gate_events WHERE run_id = ?1
              )",
             params![run_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -937,6 +980,8 @@ fn event_id_exists(transaction: &Transaction<'_>, event_id: &EventId) -> Result<
                 SELECT event_id FROM events WHERE event_id = ?1
                 UNION ALL
                 SELECT event_id FROM pipeline_events WHERE event_id = ?1
+                UNION ALL
+                SELECT event_id FROM publication_gate_events WHERE event_id = ?1
              ) LIMIT 1",
             params![event_id.as_str()],
             |_| Ok(true),
@@ -1027,6 +1072,18 @@ impl fmt::Display for StoreError {
             }
             Self::SemanticBatchConflict => {
                 formatter.write_str("semantic batch ID was reused with different content")
+            }
+            Self::PublicationGateAlreadyExists => {
+                formatter.write_str("publication gate is already registered")
+            }
+            Self::PublicationGateNotFound => formatter.write_str("publication gate was not found"),
+            Self::InvalidInitialPublicationGate => {
+                formatter.write_str("publication gate initial state is not pristine")
+            }
+            Self::PublicationGateTransition(error) => error.fmt(formatter),
+            Self::M1PublicationPredicate(error) => write!(formatter, "{error:?}"),
+            Self::M1PublicationGateAtomicity => {
+                formatter.write_str("M1 publication gate effects must commit atomically")
             }
         }
     }

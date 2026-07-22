@@ -250,12 +250,23 @@ impl PipelineState {
         Self::new(self.definition_digest, definitions).is_ok_and(|initial| initial == *self)
     }
 
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn stage_states(&self) -> Vec<StageState> {
         self.nodes.values().map(|node| node.stage.clone()).collect()
     }
 
     pub fn stage(&self, stage_instance_id: &StageInstanceId) -> Option<&StageState> {
         self.nodes.get(stage_instance_id).map(|node| &node.stage)
+    }
+
+    pub fn node_definition(
+        &self,
+        stage_instance_id: &StageInstanceId,
+    ) -> Option<&PipelineNodeDefinition> {
+        self.nodes.get(stage_instance_id)
     }
 
     pub fn stage_is_frozen(&self, stage_instance_id: &StageInstanceId) -> bool {

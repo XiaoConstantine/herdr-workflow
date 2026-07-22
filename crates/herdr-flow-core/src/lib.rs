@@ -17,7 +17,9 @@ mod digest;
 mod envelope;
 mod git;
 mod id;
+mod m1;
 mod pipeline;
+mod publication;
 mod stage;
 
 pub use adversarial_review::{
@@ -39,10 +41,22 @@ pub use id::{
     ArtifactId, BatchId, EventId, FindingId, IdentifierError, MessageId, ParticipantPrincipalId,
     RoleBindingId, RunId, StageInstanceId,
 };
+pub use m1::{
+    decide_m1_publication_invalidation, m1_adversarial_pipeline,
+    validate_m1_publication_authorization, M1DefinitionError, M1PipelineArtifacts,
+    M1PipelineStages, M1PublicationInvalidationDecision, M1PublicationPredicateError,
+    M1StageIdentity,
+};
 pub use pipeline::{
     replay_pipeline, InputManifestArtifact, PipelineCommand, PipelineDefinitionError,
     PipelineEvent, PipelineEventKind, PipelineNodeDefinition, PipelineState,
     PipelineTransitionError, StageInputManifest,
+};
+pub use publication::{
+    replay_publication_gate, PublicationAuthorization, PublicationFeedbackTarget,
+    PublicationGateCommand, PublicationGateError, PublicationGateEvent, PublicationGateEventKind,
+    PublicationGatePhase, PublicationGateRegistration, PublicationGateState, PublicationManifest,
+    PublicationObservation, TargetDriftPolicy,
 };
 pub use stage::{
     replay_stage, StageCommand, StageEvent, StageEventKind, StagePhase, StageState,
