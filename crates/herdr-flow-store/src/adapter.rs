@@ -7,10 +7,13 @@ use std::{
 use herdr_flow_core::{
     canonical_json, ParticipantPrincipalId, RunId, Sha256Digest, StageInstanceId,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::{SqliteStore, StoreError};
+use crate::{
+    lease::{lease_now, LeasedRun, RunLeaseFence, UnixMillisClock},
+    SqliteStore, StoreError,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -379,7 +382,6 @@ struct DurableAgentBinding {
 }
 
 impl DurableAgentBinding {
-    #[cfg(test)]
     fn new(
         run_id: &RunId,
         stage_instance_id: &StageInstanceId,
@@ -413,6 +415,23 @@ impl SqliteStore {
         role_slot: &str,
         binding: &AgentSessionBinding,
     ) -> Result<(), StoreError> {
+        self.persist_agent_session_binding_inner(
+            run_id,
+            stage_instance_id,
+            role_slot,
+            binding,
+            None,
+        )
+    }
+
+    fn persist_agent_session_binding_inner(
+        &mut self,
+        run_id: &RunId,
+        stage_instance_id: &StageInstanceId,
+        role_slot: &str,
+        binding: &AgentSessionBinding,
+        lease: Option<(&RunLeaseFence, &dyn UnixMillisClock)>,
+    ) -> Result<(), StoreError> {
         if role_slot.is_empty() {
             return Err(StoreError::AdapterContract(
                 AdapterContractError::EmptyOpaqueIdentity,
@@ -422,8 +441,17 @@ impl SqliteStore {
         let value = serde_json::to_value(&durable).map_err(StoreError::Serialization)?;
         let json = canonical_json::to_vec(&value).map_err(StoreError::Canonicalization)?;
         let digest = Sha256Digest::of_bytes(&json);
-        let inserted = self
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        if let Some((fence, clock)) = lease {
+            lease_now(&transaction, fence, clock)?;
+            if fence.run_id() != run_id {
+                return Err(StoreError::RunLeaseRequired);
+            }
+        }
+        let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO agent_session_bindings(
                     run_id, stage_instance_id, role_slot, record_digest, record_json
@@ -438,12 +466,13 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         if inserted == 0 {
-            let existing = load_durable_binding(self, run_id, stage_instance_id, role_slot)?;
+            let existing =
+                load_durable_binding_from(&transaction, run_id, stage_instance_id, role_slot)?;
             if existing != durable {
                 return Err(StoreError::AgentBindingConflict);
             }
         }
-        Ok(())
+        transaction.commit().map_err(StoreError::Sqlite)
     }
 
     pub fn load_and_revalidate_agent_session_binding(
@@ -495,14 +524,40 @@ impl SqliteStore {
     }
 }
 
+impl LeasedRun<'_, '_> {
+    pub fn persist_agent_session_binding(
+        &mut self,
+        stage_instance_id: &StageInstanceId,
+        role_slot: &str,
+        binding: &AgentSessionBinding,
+    ) -> Result<(), StoreError> {
+        let run_id = self.fence.run_id().clone();
+        self.store.persist_agent_session_binding_inner(
+            &run_id,
+            stage_instance_id,
+            role_slot,
+            binding,
+            Some((&self.fence, self.clock)),
+        )
+    }
+}
+
 fn load_durable_binding(
     store: &SqliteStore,
     run_id: &RunId,
     stage_instance_id: &StageInstanceId,
     role_slot: &str,
 ) -> Result<DurableAgentBinding, StoreError> {
-    let row: Option<(String, Vec<u8>)> = store
-        .connection
+    load_durable_binding_from(&store.connection, run_id, stage_instance_id, role_slot)
+}
+
+fn load_durable_binding_from(
+    connection: &Connection,
+    run_id: &RunId,
+    stage_instance_id: &StageInstanceId,
+    role_slot: &str,
+) -> Result<DurableAgentBinding, StoreError> {
+    let row: Option<(String, Vec<u8>)> = connection
         .query_row(
             "SELECT record_digest, record_json FROM agent_session_bindings
              WHERE run_id = ?1 AND stage_instance_id = ?2 AND role_slot = ?3",
