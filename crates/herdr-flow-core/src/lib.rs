@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+mod adversarial_review;
 mod artifact;
 pub mod canonical_json;
 mod digest;
@@ -19,6 +20,12 @@ mod id;
 mod pipeline;
 mod stage;
 
+pub use adversarial_review::{
+    replay_adversarial_review, AdversarialReviewCommand, AdversarialReviewError,
+    AdversarialReviewEvent, AdversarialReviewEventKind, AdversarialReviewState, FindingDisposition,
+    FindingSeverity, FindingStatus, ReviewCandidate, ReviewDecision, ReviewFinding, ReviewPhase,
+    ReviewerFindingAction, ReviewerSlot,
+};
 pub use artifact::{
     ArtifactCatalog, ArtifactCatalogError, ArtifactRecord, ArtifactRecordValidationError,
 };
@@ -29,7 +36,7 @@ pub use envelope::{
 };
 pub use git::{GitObjectFormat, GitObjectId, GitObjectIdError};
 pub use id::{
-    ArtifactId, BatchId, EventId, IdentifierError, MessageId, ParticipantPrincipalId,
+    ArtifactId, BatchId, EventId, FindingId, IdentifierError, MessageId, ParticipantPrincipalId,
     RoleBindingId, RunId, StageInstanceId,
 };
 pub use pipeline::{
