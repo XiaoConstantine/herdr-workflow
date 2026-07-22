@@ -38,8 +38,8 @@ pub use envelope::{
 };
 pub use git::{GitObjectFormat, GitObjectId, GitObjectIdError};
 pub use id::{
-    ArtifactId, BatchId, EventId, FindingId, IdentifierError, MessageId, ParticipantPrincipalId,
-    RoleBindingId, RunId, StageInstanceId,
+    ArtifactId, BatchId, EventId, FindingId, IdentifierError, MessageId, OperationId,
+    ParticipantPrincipalId, RoleBindingId, RunId, StageInstanceId,
 };
 pub use m1::{
     decide_m1_publication_invalidation, m1_adversarial_pipeline,
@@ -56,7 +56,7 @@ pub use publication::{
     replay_publication_gate, PublicationAuthorization, PublicationFeedbackTarget,
     PublicationGateCommand, PublicationGateError, PublicationGateEvent, PublicationGateEventKind,
     PublicationGatePhase, PublicationGateRegistration, PublicationGateState, PublicationManifest,
-    PublicationObservation, TargetDriftPolicy,
+    PublicationObservation, PublicationSideEffectKind, TargetDriftPolicy,
 };
 pub use stage::{
     replay_stage, StageCommand, StageEvent, StageEventKind, StagePhase, StageState,

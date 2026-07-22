@@ -79,6 +79,13 @@ pub enum PublicationFeedbackTarget {
     Cancellation,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublicationSideEffectKind {
+    PushRef,
+    CreateChangeRequest,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PublicationObservation {
     pub target_object: GitObjectId,
@@ -508,15 +515,25 @@ impl PublicationGateState {
         &self,
         authorization: &PublicationAuthorization,
         observation: &PublicationObservation,
+        kind: PublicationSideEffectKind,
     ) -> Result<(), PublicationGateError> {
         self.validate_current_authorization(authorization)?;
         let manifest = self
             .manifest
             .as_ref()
             .ok_or(PublicationGateError::ManifestDigestMismatch)?;
+        let head_matches = match kind {
+            PublicationSideEffectKind::PushRef => {
+                observation.head_object == manifest.expected_head_object
+                    || observation.head_object.as_ref() == Some(&manifest.final_object)
+            }
+            PublicationSideEffectKind::CreateChangeRequest => {
+                observation.head_object.as_ref() == Some(&manifest.final_object)
+            }
+        };
         if observation.target_object != manifest.observed_target_object
             || observation.merge_base != manifest.reviewed_merge_base
-            || observation.head_object != manifest.expected_head_object
+            || !head_matches
         {
             return Err(PublicationGateError::TargetDrift);
         }
@@ -697,6 +714,7 @@ mod tests {
                     merge_base: manifest().reviewed_merge_base,
                     head_object: None,
                 },
+                PublicationSideEffectKind::PushRef,
             )
             .unwrap();
         assert_eq!(
@@ -707,6 +725,7 @@ mod tests {
                     merge_base: manifest().reviewed_merge_base,
                     head_object: None,
                 },
+                PublicationSideEffectKind::PushRef,
             ),
             Err(PublicationGateError::TargetDrift)
         );

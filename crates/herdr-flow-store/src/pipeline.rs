@@ -339,7 +339,9 @@ impl SqliteStore {
         run_id: &RunId,
         gate_stage_instance_id: &herdr_flow_core::StageInstanceId,
         authorization: &herdr_flow_core::PublicationAuthorization,
+        manifest: &herdr_flow_core::PublicationManifest,
         observation: &herdr_flow_core::PublicationObservation,
+        kind: herdr_flow_core::PublicationSideEffectKind,
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
@@ -348,13 +350,14 @@ impl SqliteStore {
         verify_run_journal(&transaction, run_id)?;
         let gate = verified_publication_gate(&transaction, run_id, gate_stage_instance_id)?;
         let pipeline = verified_pipeline(&transaction, run_id)?;
-        if !pipeline.artifact_is_valid(&gate.expected_authorization_artifact_id)
+        if gate.manifest.as_ref() != Some(manifest)
+            || !pipeline.artifact_is_valid(&gate.expected_authorization_artifact_id)
             || pipeline.stage_is_frozen(&gate.expected_publication_stage_instance_id)
             || pipeline.stage_is_invalidated(&gate.expected_publication_stage_instance_id)
         {
             return Err(StoreError::M1PublicationGateAtomicity);
         }
-        gate.validate_pre_side_effect(authorization, observation)
+        gate.validate_pre_side_effect(authorization, observation, kind)
             .map_err(StoreError::PublicationGateTransition)?;
         transaction.commit().map_err(StoreError::Sqlite)
     }
@@ -1107,6 +1110,19 @@ fn validate_registered_m1_batch(
         if has_gate_invalidation != invalidates_authorization {
             return Err(StoreError::M1PublicationGateAtomicity);
         }
+        if has_gate_invalidation {
+            let claimed: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM publication_outbox
+                     WHERE run_id = ?1 AND status IN ('CLAIMED', 'EFFECT_UNKNOWN')",
+                    params![batch.run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::Sqlite)?;
+            if claimed != 0 {
+                return Err(StoreError::PublicationOutboxNotReady);
+            }
+        }
     }
     Ok(())
 }
@@ -1458,7 +1474,7 @@ pub(crate) fn pipeline_message_id_exists(
         .map_err(StoreError::Sqlite)
 }
 
-fn verified_publication_gate(
+pub(crate) fn verified_publication_gate(
     connection: &Connection,
     run_id: &RunId,
     stage_instance_id: &herdr_flow_core::StageInstanceId,
@@ -1518,7 +1534,10 @@ fn verified_publication_gate(
     Ok(stored)
 }
 
-fn verified_pipeline(connection: &Connection, run_id: &RunId) -> Result<PipelineState, StoreError> {
+pub(crate) fn verified_pipeline(
+    connection: &Connection,
+    run_id: &RunId,
+) -> Result<PipelineState, StoreError> {
     let row: Option<(i64, Vec<u8>, Vec<u8>)> = connection
         .query_row(
             "SELECT control_revision, initial_state_json, state_json

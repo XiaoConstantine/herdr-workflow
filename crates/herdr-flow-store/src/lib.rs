@@ -4,11 +4,17 @@
 
 mod artifact;
 mod git;
+mod outbox;
 mod pipeline;
 mod registry;
 
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
 pub use git::{GitRepository, GitRepositoryError, SnapshotRefOutcome};
+pub use outbox::{
+    reconcile_publication, ChangeRequestResult, PublicationIntent, PublicationIntentKind,
+    PublicationIntentRecord, PublicationOutboxStatus, PublicationProvider,
+    PublicationProviderError, PublicationResult, PushResult, ReconcileOutcome,
+};
 pub use pipeline::{
     SemanticBatch, SemanticCommitOutcome, SemanticPipelineEntry, SemanticPublicationGateEntry,
     SemanticStageEntry,
@@ -126,6 +132,9 @@ pub enum StoreError {
     PublicationGateTransition(herdr_flow_core::PublicationGateError),
     M1PublicationPredicate(herdr_flow_core::M1PublicationPredicateError),
     M1PublicationGateAtomicity,
+    PublicationOutboxConflict,
+    PublicationOutboxNotReady,
+    PublicationProvider(outbox::PublicationProviderError),
 }
 
 impl SqliteStore {
@@ -211,6 +220,47 @@ impl SqliteStore {
 
                 CREATE INDEX IF NOT EXISTS publication_gate_events_run_sequence
                     ON publication_gate_events(run_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS publication_outbox (
+                    operation_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    ordinal INTEGER NOT NULL CHECK(ordinal IN (0, 1)),
+                    gate_stage_instance_id TEXT NOT NULL,
+                    manifest_digest TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    request_json BLOB NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('PENDING', 'CLAIMED', 'EFFECT_UNKNOWN', 'COMPLETED')),
+                    claim_owner TEXT,
+                    result_digest TEXT,
+                    result_json BLOB,
+                    UNIQUE(run_id, manifest_digest, ordinal),
+                    CHECK((status = 'PENDING' AND claim_owner IS NULL
+                            AND result_digest IS NULL AND result_json IS NULL)
+                       OR (status = 'CLAIMED' AND claim_owner IS NOT NULL
+                            AND result_digest IS NULL AND result_json IS NULL)
+                       OR (status = 'EFFECT_UNKNOWN' AND claim_owner IS NOT NULL
+                            AND result_digest IS NULL AND result_json IS NULL)
+                       OR (status = 'COMPLETED' AND claim_owner IS NULL
+                            AND result_digest IS NOT NULL AND result_json IS NOT NULL)),
+                    FOREIGN KEY(gate_stage_instance_id, run_id)
+                        REFERENCES publication_gate_snapshots(stage_instance_id, run_id)
+                        ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE INDEX IF NOT EXISTS publication_outbox_pending
+                    ON publication_outbox(run_id, status, ordinal);
+
+                CREATE TABLE IF NOT EXISTS publication_outbox_generations (
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    manifest_digest TEXT NOT NULL,
+                    push_operation_id TEXT NOT NULL UNIQUE,
+                    push_request_digest TEXT NOT NULL,
+                    change_request_operation_id TEXT NOT NULL UNIQUE,
+                    change_request_request_digest TEXT NOT NULL,
+                    generation_digest TEXT NOT NULL,
+                    generation_json BLOB NOT NULL,
+                    PRIMARY KEY(run_id, manifest_digest)
+                ) STRICT;
 
                 CREATE TABLE IF NOT EXISTS pipeline_events (
                     event_id TEXT PRIMARY KEY,
@@ -1085,6 +1135,13 @@ impl fmt::Display for StoreError {
             Self::M1PublicationGateAtomicity => {
                 formatter.write_str("M1 publication gate effects must commit atomically")
             }
+            Self::PublicationOutboxConflict => {
+                formatter.write_str("publication outbox intent conflicts with durable state")
+            }
+            Self::PublicationOutboxNotReady => {
+                formatter.write_str("publication outbox dependency is not complete")
+            }
+            Self::PublicationProvider(error) => error.fmt(formatter),
         }
     }
 }
