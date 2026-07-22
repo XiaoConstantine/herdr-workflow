@@ -32,6 +32,7 @@ pub use adversarial_review::{
 };
 pub use artifact::{
     ArtifactCatalog, ArtifactCatalogError, ArtifactRecord, ArtifactRecordValidationError,
+    RunIngressArtifactRecord,
 };
 pub use digest::{DigestParseError, Sha256Digest};
 pub use envelope::{

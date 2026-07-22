@@ -36,6 +36,7 @@ pub(crate) struct PreparedArtifact {
     pub(crate) parent_artifact_ids: Vec<ArtifactId>,
     pub(crate) record_json: Vec<u8>,
     pub(crate) record_digest: Sha256Digest,
+    pub(crate) bytes: Vec<u8>,
 }
 
 pub(crate) fn prepare_artifacts(
@@ -69,6 +70,7 @@ pub(crate) fn prepare_artifacts(
             parent_artifact_ids,
             record_digest: Sha256Digest::of_bytes(&record_json),
             record_json,
+            bytes: registration.bytes.to_vec(),
         });
     }
     Ok(prepared)
@@ -109,12 +111,27 @@ pub(crate) fn validate_new_artifacts(
             StageEventKind::NodeReady {
                 input_manifest_digest,
             } => {
-                if record.producer_attempt != 0
+                let manifest: herdr_flow_core::StageInputManifest =
+                    serde_json::from_slice(&artifact.bytes).map_err(StoreError::Serialization)?;
+                let canonical = manifest
+                    .canonical_bytes()
+                    .map_err(StoreError::Canonicalization)?;
+                let mut expected_parents = manifest
+                    .artifacts
+                    .iter()
+                    .map(|input| input.artifact_id.clone())
+                    .collect::<Vec<_>>();
+                expected_parents.sort();
+                expected_parents.dedup();
+                if canonical != artifact.bytes
+                    || manifest.stage_instance_id != producer_state.stage_instance_id
+                    || record.producer_attempt != 0
                     || record.sha256 != *input_manifest_digest
-                    || !artifact.parent_artifact_ids.is_empty()
+                    || Sha256Digest::of_bytes(&canonical) != *input_manifest_digest
+                    || artifact.parent_artifact_ids != expected_parents
                 {
                     return Err(StoreError::ArtifactMetadataMismatch(
-                        "run ingress artifact is not bound to the ready event",
+                        "stage input manifest is not bound to the ready event and exact inputs",
                     ));
                 }
             }
@@ -233,6 +250,7 @@ pub(crate) fn insert_artifacts(
 ) -> Result<(), StoreError> {
     for artifact in artifacts {
         let record = &artifact.record;
+        claim_artifact_identity(transaction, run_id, record)?;
         transaction
             .execute(
                 "INSERT INTO artifacts(
@@ -252,10 +270,27 @@ pub(crate) fn insert_artifacts(
             )
             .map_err(StoreError::Sqlite)?;
         for parent in &artifact.parent_artifact_ids {
+            let ingress_parent: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM run_ingress_artifacts
+                        WHERE artifact_id = ?1 AND run_id = ?2
+                     )",
+                    params![parent.as_str(), run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::Sqlite)?;
+            let table = if ingress_parent {
+                "artifact_ingress_edges"
+            } else {
+                "artifact_edges"
+            };
             transaction
                 .execute(
-                    "INSERT INTO artifact_edges(run_id, parent_artifact_id, child_artifact_id)
-                     VALUES (?1, ?2, ?3)",
+                    &format!(
+                        "INSERT INTO {table}(run_id, parent_artifact_id, child_artifact_id)
+                         VALUES (?1, ?2, ?3)"
+                    ),
                     params![
                         run_id.as_str(),
                         parent.as_str(),
@@ -264,6 +299,59 @@ pub(crate) fn insert_artifacts(
                 )
                 .map_err(StoreError::Sqlite)?;
         }
+    }
+    Ok(())
+}
+
+fn claim_artifact_identity(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    record: &ArtifactRecord,
+) -> Result<(), StoreError> {
+    type Identity = (String, String, Option<String>, Option<String>);
+    let identity: Option<Identity> = transaction
+        .query_row(
+            "SELECT run_id, identity_kind, expected_producer_stage_instance_id,
+                    expected_artifact_type
+             FROM artifact_identities WHERE artifact_id = ?1",
+            params![record.artifact_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    match identity {
+        None => {
+            transaction
+                .execute(
+                    "INSERT INTO artifact_identities(
+                        artifact_id, run_id, identity_kind,
+                        expected_producer_stage_instance_id, expected_artifact_type
+                     ) VALUES (?1, ?2, 'REGULAR', NULL, NULL)",
+                    params![record.artifact_id.as_str(), run_id.as_str()],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        Some((stored_run, kind, producer, artifact_type))
+            if stored_run == run_id.as_str()
+                && kind == "RESERVED"
+                && producer.as_deref() == Some(record.producer_stage_instance_id.as_str())
+                && artifact_type.as_deref() == Some(record.artifact_type.as_str()) =>
+        {
+            let updated = transaction
+                .execute(
+                    "UPDATE artifact_identities
+                     SET identity_kind = 'REGULAR',
+                         expected_producer_stage_instance_id = NULL,
+                         expected_artifact_type = NULL
+                     WHERE artifact_id = ?1 AND identity_kind = 'RESERVED'",
+                    params![record.artifact_id.as_str()],
+                )
+                .map_err(StoreError::Sqlite)?;
+            if updated != 1 {
+                return Err(StoreError::ArtifactIdConflict);
+            }
+        }
+        Some(_) => return Err(StoreError::ArtifactIdConflict),
     }
     Ok(())
 }
@@ -344,12 +432,34 @@ pub(crate) fn load_and_verify_run_artifacts(
                 "pipeline definition digest does not match the run",
             ));
         }
+        let identity: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT run_id, identity_kind FROM artifact_identities WHERE artifact_id = ?1",
+                params![stored.record.artifact_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        if identity
+            .as_ref()
+            .map(|(run, kind)| (run.as_str(), kind.as_str()))
+            != Some((run_id.as_str(), "REGULAR"))
+        {
+            return Err(StoreError::ArtifactIdConflict);
+        }
         pending.push(stored);
     }
 
     let mut catalog = ArtifactCatalog::new();
     let mut accepted_ids = BTreeSet::new();
-    let mut stored_records = Vec::with_capacity(pending.len());
+    let mut stored_records = crate::coordinator::load_run_ingress_records(transaction, run_id)?;
+    for stored in &stored_records {
+        catalog
+            .register(stored.record.clone(), &stored.parent_artifact_ids)
+            .map_err(StoreError::ArtifactGraph)?;
+        accepted_ids.insert(stored.record.artifact_id.clone());
+    }
+    stored_records.reserve(pending.len());
     while !pending.is_empty() {
         let Some(index) = pending.iter().position(|stored| {
             stored
@@ -456,6 +566,9 @@ pub(crate) fn load_artifact_record(
         .prepare(
             "SELECT parent_artifact_id FROM artifact_edges
              WHERE run_id = ?1 AND child_artifact_id = ?2
+             UNION ALL
+             SELECT parent_artifact_id FROM artifact_ingress_edges
+             WHERE run_id = ?1 AND child_artifact_id = ?2
              ORDER BY parent_artifact_id",
         )
         .map_err(StoreError::Sqlite)?;
@@ -500,7 +613,9 @@ fn artifact_run_id(
 ) -> Result<Option<RunId>, StoreError> {
     transaction
         .query_row(
-            "SELECT run_id FROM artifacts WHERE artifact_id = ?1",
+            "SELECT run_id FROM artifacts WHERE artifact_id = ?1
+             UNION ALL
+             SELECT run_id FROM run_ingress_artifacts WHERE artifact_id = ?1",
             params![artifact_id.as_str()],
             |row| row.get::<_, String>(0),
         )

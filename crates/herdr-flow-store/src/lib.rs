@@ -4,6 +4,7 @@
 
 mod adapter;
 mod artifact;
+mod coordinator;
 mod git;
 mod human;
 mod lease;
@@ -18,6 +19,9 @@ pub use adapter::{
     IntegrationPreflightReceipt,
 };
 pub use artifact::{ArtifactStore, ArtifactStoreError, StoredArtifact};
+pub use coordinator::{
+    M1IdSource, M1ReconcileOutcome, M1RunIngress, M1StartDescriptor, M1StartOutcome, ResumableM1Run,
+};
 pub use git::{GitRepository, GitRepositoryError, SnapshotRefOutcome};
 pub use human::{QueuedHumanAction, QueuedHumanActionStatus};
 pub use lease::{ClockError, LeasedRun, RunLeaseFence, SystemClock, UnixMillisClock};
@@ -169,6 +173,11 @@ pub enum StoreError {
     RunLeaseRequired,
     InvalidRunLeaseDuration,
     Clock(ClockError),
+    M1StartConflict,
+    InvalidM1Start,
+    RunIngressConflict,
+    IdSourceExhausted,
+    IncompatibleSchema,
 }
 
 impl SqliteStore {
@@ -214,6 +223,28 @@ impl SqliteStore {
                     pipeline_definition_digest TEXT NOT NULL,
                     next_event_sequence INTEGER NOT NULL
                         CHECK(next_event_sequence >= 1 AND next_event_sequence <= 9007199254740991)
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    migration_name TEXT PRIMARY KEY
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS artifact_identities (
+                    artifact_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    identity_kind TEXT NOT NULL CHECK(
+                        identity_kind IN ('INGRESS', 'RESERVED', 'REGULAR')
+                    ),
+                    expected_producer_stage_instance_id TEXT,
+                    expected_artifact_type TEXT,
+                    CHECK(
+                        (identity_kind = 'RESERVED'
+                            AND expected_producer_stage_instance_id IS NOT NULL
+                            AND expected_artifact_type IS NOT NULL)
+                        OR (identity_kind <> 'RESERVED'
+                            AND expected_producer_stage_instance_id IS NULL
+                            AND expected_artifact_type IS NULL)
+                    )
                 ) STRICT;
 
                 CREATE TABLE IF NOT EXISTS stage_snapshots (
@@ -513,6 +544,47 @@ impl SqliteStore {
 
                 CREATE INDEX IF NOT EXISTS artifact_edges_child
                     ON artifact_edges(run_id, child_artifact_id, parent_artifact_id);
+
+                CREATE TABLE IF NOT EXISTS artifact_ingress_edges (
+                    run_id TEXT NOT NULL,
+                    parent_artifact_id TEXT NOT NULL,
+                    child_artifact_id TEXT NOT NULL,
+                    PRIMARY KEY(run_id, parent_artifact_id, child_artifact_id),
+                    FOREIGN KEY(parent_artifact_id, run_id)
+                        REFERENCES run_ingress_artifacts(artifact_id, run_id) ON DELETE RESTRICT,
+                    FOREIGN KEY(child_artifact_id, run_id)
+                        REFERENCES artifacts(artifact_id, run_id) ON DELETE RESTRICT
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS m1_run_starts (
+                    run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    start_digest TEXT NOT NULL,
+                    start_json BLOB NOT NULL,
+                    batch_id TEXT NOT NULL UNIQUE,
+                    acceptance_event_id TEXT NOT NULL UNIQUE,
+                    acceptance_sequence INTEGER NOT NULL,
+                    ingress_artifact_id TEXT NOT NULL UNIQUE,
+                    ingress_record_digest TEXT NOT NULL,
+                    ingress_record_json BLOB NOT NULL,
+                    FOREIGN KEY(acceptance_event_id)
+                        REFERENCES pipeline_events(event_id) ON DELETE RESTRICT,
+                    UNIQUE(run_id, acceptance_sequence),
+                    UNIQUE(ingress_artifact_id, run_id)
+                ) STRICT;
+
+                CREATE TABLE IF NOT EXISTS run_ingress_artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
+                    sha256 TEXT NOT NULL,
+                    size INTEGER NOT NULL CHECK(size >= 0),
+                    producer_event_sequence INTEGER NOT NULL,
+                    record_digest TEXT NOT NULL,
+                    record_json BLOB NOT NULL,
+                    UNIQUE(artifact_id, run_id),
+                    FOREIGN KEY(run_id, producer_event_sequence)
+                        REFERENCES pipeline_events(run_id, sequence) ON DELETE RESTRICT
+                ) STRICT;
+
                 ",
             )
             .map_err(StoreError::Sqlite)?;
@@ -526,6 +598,48 @@ impl SqliteStore {
                 )
                 .map_err(StoreError::Sqlite)?;
         }
+        let m1_v2_applied: bool = schema_transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM schema_migrations
+                    WHERE migration_name = 'm1-coordinator-bootstrap-v2'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if !m1_v2_applied {
+            schema_transaction
+                .execute(
+                    "INSERT OR IGNORE INTO artifact_identities(
+                        artifact_id, run_id, identity_kind,
+                        expected_producer_stage_instance_id, expected_artifact_type
+                     ) SELECT artifact_id, run_id, 'REGULAR', NULL, NULL FROM artifacts",
+                    [],
+                )
+                .map_err(StoreError::Sqlite)?;
+            schema_transaction
+                .execute(
+                    "INSERT OR IGNORE INTO artifact_identities(
+                        artifact_id, run_id, identity_kind,
+                        expected_producer_stage_instance_id, expected_artifact_type
+                     ) SELECT artifact_id, run_id, 'INGRESS', NULL, NULL
+                       FROM run_ingress_artifacts",
+                    [],
+                )
+                .map_err(StoreError::Sqlite)?;
+            coordinator::migrate_m1_artifact_reservations(&schema_transaction)?;
+            if coordinator::has_legacy_scheduled_m1_run(&schema_transaction)? {
+                return Err(StoreError::IncompatibleSchema);
+            }
+            schema_transaction
+                .execute(
+                    "INSERT INTO schema_migrations(migration_name)
+                     VALUES ('m1-coordinator-bootstrap-v2')",
+                    [],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
         schema_transaction.commit().map_err(StoreError::Sqlite)?;
         verify_pragmas(&connection)?;
         Ok(Self {
@@ -535,7 +649,8 @@ impl SqliteStore {
         })
     }
 
-    /// Creates an empty run before any stage instances or events are registered.
+    /// Legacy low-level bootstrap retained only for isolated journal tests.
+    #[cfg(test)]
     pub fn create_run(
         &mut self,
         run_id: &RunId,
@@ -893,6 +1008,7 @@ impl SqliteStore {
             .map_err(StoreError::Sqlite)?;
         verify_run_journal(&transaction, run_id)?;
         let records = registry::load_and_verify_run_artifacts(&transaction, run_id)?;
+        coordinator::verify_run_ingress_bytes(&transaction, run_id, artifact_store)?;
         review::verify_adversarial_review_candidate_bytes(&transaction, run_id, artifact_store)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         registry::verify_artifact_bytes(artifact_store, &records)?;
@@ -1036,7 +1152,10 @@ fn load_events(
         .collect()
 }
 
-fn verify_run_journal(connection: &Connection, run_id: &RunId) -> Result<(), StoreError> {
+pub(crate) fn verify_run_journal(
+    connection: &Connection,
+    run_id: &RunId,
+) -> Result<(), StoreError> {
     let next_sequence: i64 = connection
         .query_row(
             "SELECT next_event_sequence FROM runs WHERE run_id = ?1",
@@ -1222,7 +1341,10 @@ fn event_by_message_id(
     row.map(decode_event_row).transpose()
 }
 
-fn event_id_exists(transaction: &Transaction<'_>, event_id: &EventId) -> Result<bool, StoreError> {
+pub(crate) fn event_id_exists(
+    transaction: &Transaction<'_>,
+    event_id: &EventId,
+) -> Result<bool, StoreError> {
     transaction
         .query_row(
             "SELECT 1 FROM (
@@ -1373,6 +1495,15 @@ impl fmt::Display for StoreError {
             Self::RunLeaseRequired => formatter.write_str("an active run lease is required"),
             Self::InvalidRunLeaseDuration => formatter.write_str("run lease duration is invalid"),
             Self::Clock(error) => write!(formatter, "clock failed: {error}"),
+            Self::M1StartConflict => formatter.write_str("M1 start does not match the durable run"),
+            Self::InvalidM1Start => {
+                formatter.write_str("M1 start descriptor or ingress is invalid")
+            }
+            Self::RunIngressConflict => formatter.write_str("run ingress commitment conflicts"),
+            Self::IdSourceExhausted => formatter.write_str("coordinator ID source is exhausted"),
+            Self::IncompatibleSchema => {
+                formatter.write_str("database requires an incompatible explicit migration")
+            }
         }
     }
 }
@@ -1915,8 +2046,14 @@ mod tests {
     fn production_api_bootstraps_ingress_and_reaches_running() {
         let mut test = test_store();
         let artifact_store = ArtifactStore::open(test._directory.path().join("artifacts")).unwrap();
-        let input_bytes = br#"{"inputs":[]}"#;
-        let input_digest = digest(input_bytes);
+        let input_bytes = herdr_flow_core::StageInputManifest {
+            protocol: herdr_flow_core::BASE_PROTOCOL.to_owned(),
+            stage_instance_id: test.initial.stage_instance_id.clone(),
+            artifacts: Vec::new(),
+        }
+        .canonical_bytes()
+        .unwrap();
+        let input_digest = digest(&input_bytes);
         let ingress = ArtifactRecord {
             artifact_id: format!("art_{ARTIFACT_ULID_1}").parse().unwrap(),
             artifact_type: "stage-input-manifest/v1".to_owned(),
@@ -1933,7 +2070,7 @@ mod tests {
             input_manifest_digest: input_digest,
             retention_class: "run-record".to_owned(),
         };
-        let ready = ready_event(&test.initial, input_bytes);
+        let ready = ready_event(&test.initial, &input_bytes);
         test.store
             .append_stage_event_with_artifacts(
                 AppendStageEvent {
@@ -1947,7 +2084,7 @@ mod tests {
                 &[ArtifactRegistration {
                     record: &ingress,
                     parent_artifact_ids: &[],
-                    bytes: input_bytes,
+                    bytes: &input_bytes,
                 }],
             )
             .unwrap();

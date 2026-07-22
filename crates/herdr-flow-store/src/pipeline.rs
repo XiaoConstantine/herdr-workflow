@@ -443,6 +443,16 @@ impl SqliteStore {
             )
             .map_err(StoreError::Sqlite)?;
         let first_sequence = from_sql_integer(next_sequence)?;
+        let bootstrap_batch_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM m1_run_starts WHERE batch_id = ?1)",
+                params![batch.batch_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if bootstrap_batch_exists {
+            return Err(StoreError::SemanticBatchConflict);
+        }
         let committed_first_sequence = semantic_batch_first_sequence(&transaction, batch.batch_id)?;
         let commitment = semantic_batch_commitment(
             &batch,
@@ -1045,7 +1055,7 @@ fn insert_publication_gate_event(
     Ok(())
 }
 
-fn insert_pipeline_event(
+pub(crate) fn insert_pipeline_event(
     transaction: &Transaction<'_>,
     run_id: &RunId,
     sequence: u64,
@@ -1084,7 +1094,7 @@ fn insert_pipeline_event(
     Ok(())
 }
 
-fn validate_gate_registration(
+pub(crate) fn validate_gate_registration(
     pipeline: &PipelineState,
     gate: &PublicationGateState,
 ) -> Result<(), StoreError> {
@@ -1580,11 +1590,28 @@ fn validate_pipeline_artifact_acceptance(
     else {
         return Ok(());
     };
-    let stored = registry::load_artifact_record(transaction, run_id, artifact_id)?
-        .ok_or(StoreError::ArtifactNotFound)?;
-    if stored.record.sha256 != *sha256 || stored.parent_artifact_ids != *parent_artifact_ids {
+    if let Some(stored) = registry::load_artifact_record(transaction, run_id, artifact_id)? {
+        if stored.record.sha256 != *sha256 || stored.parent_artifact_ids != *parent_artifact_ids {
+            return Err(StoreError::ArtifactMetadataMismatch(
+                "pipeline artifact acceptance does not match the registry",
+            ));
+        }
+        return Ok(());
+    }
+    let ingress: Option<String> = transaction
+        .query_row(
+            "SELECT sha256 FROM run_ingress_artifacts
+             WHERE artifact_id = ?1 AND run_id = ?2",
+            params![artifact_id.as_str(), run_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    if ingress.as_deref() != Some(sha256.to_prefixed_string().as_str())
+        || !parent_artifact_ids.is_empty()
+    {
         return Err(StoreError::ArtifactMetadataMismatch(
-            "pipeline artifact acceptance does not match the registry",
+            "pipeline artifact acceptance does not match durable ingress",
         ));
     }
     Ok(())
@@ -1649,10 +1676,23 @@ fn verify_semantic_batches(connection: &Connection, run_id: &RunId) -> Result<()
             ))
         })
         .map_err(StoreError::Sqlite)?;
-    let mut committed_event_ids = BTreeSet::new();
+    let mut committed_event_ids =
+        crate::coordinator::verify_m1_start_event_ids(connection, run_id)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
     for row in rows {
         let (batch_id, batch_digest, batch_json) = row.map_err(StoreError::Sqlite)?;
         let batch_id = BatchId::from_str(&batch_id).map_err(StoreError::Identifier)?;
+        let bootstrap_collision: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM m1_run_starts WHERE batch_id = ?1)",
+                params![batch_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if bootstrap_collision {
+            return Err(StoreError::SemanticBatchConflict);
+        }
         let batch_digest = Sha256Digest::from_str(&batch_digest).map_err(StoreError::Digest)?;
         let commitment: CanonicalSemanticBatch =
             serde_json::from_slice(&batch_json).map_err(StoreError::Serialization)?;
@@ -1859,7 +1899,7 @@ pub(crate) fn verified_pipeline(
     Ok(replayed)
 }
 
-fn load_pipeline_events(
+pub(crate) fn load_pipeline_events(
     connection: &Connection,
     run_id: &RunId,
 ) -> Result<Vec<StoredPipelineEvent>, StoreError> {

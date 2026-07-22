@@ -7,7 +7,61 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ArtifactId, Sha256Digest, StageInstanceId, MAX_CONTROL_REVISION};
+use crate::{
+    ArtifactId, RunId, Sha256Digest, StageInstanceId, BASE_PROTOCOL, MAX_CONTROL_REVISION,
+};
+
+/// Immutable coordinator-owned input committed before the root stage can be
+/// scheduled. Its producer sequence is the co-committed pipeline
+/// `ARTIFACT_ACCEPTED` event; it has no artifact parents and no agent authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunIngressArtifactRecord {
+    pub protocol: String,
+    pub artifact_id: ArtifactId,
+    pub artifact_type: String,
+    pub schema_id: String,
+    pub schema_version: u32,
+    pub sha256: Sha256Digest,
+    pub size: u64,
+    pub media_type: String,
+    pub run_id: RunId,
+    pub producer_attempt: u32,
+    pub producer_event_sequence: u64,
+    pub pipeline_definition_digest: Sha256Digest,
+    pub root_stage_instance_id: StageInstanceId,
+    pub component_digest: Sha256Digest,
+    pub retention_class: String,
+}
+
+impl RunIngressArtifactRecord {
+    pub fn validate(&self) -> Result<(), ArtifactRecordValidationError> {
+        let common = ArtifactRecord {
+            artifact_id: self.artifact_id.clone(),
+            artifact_type: self.artifact_type.clone(),
+            schema_id: self.schema_id.clone(),
+            schema_version: self.schema_version,
+            sha256: self.sha256,
+            size: self.size,
+            media_type: self.media_type.clone(),
+            producer_stage_instance_id: self.root_stage_instance_id.clone(),
+            producer_attempt: self.producer_attempt,
+            producer_event_sequence: self.producer_event_sequence,
+            pipeline_definition_digest: self.pipeline_definition_digest,
+            component_digest: self.component_digest,
+            input_manifest_digest: self.sha256,
+            retention_class: self.retention_class.clone(),
+        };
+        common.validate()?;
+        if self.protocol != BASE_PROTOCOL {
+            return Err(ArtifactRecordValidationError::InvalidProtocol);
+        }
+        if self.producer_attempt != 0 {
+            return Err(ArtifactRecordValidationError::InvalidProducerAttempt);
+        }
+        Ok(())
+    }
+}
 
 /// Immutable typed metadata for one content-addressed artifact.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -34,10 +88,12 @@ pub struct ArtifactRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactRecordValidationError {
     InvalidArtifactType,
+    InvalidProtocol,
     SchemaIdentityMismatch,
     InvalidSchemaVersion,
     InvalidMediaType,
     InvalidProducerEventSequence,
+    InvalidProducerAttempt,
     InvalidRetentionClass,
 }
 
@@ -198,6 +254,7 @@ impl fmt::Display for ArtifactRecordValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidArtifactType => formatter.write_str("invalid versioned artifact type"),
+            Self::InvalidProtocol => formatter.write_str("invalid artifact protocol"),
             Self::SchemaIdentityMismatch => {
                 formatter.write_str("schema identity does not match artifact type")
             }
@@ -206,6 +263,7 @@ impl fmt::Display for ArtifactRecordValidationError {
             Self::InvalidProducerEventSequence => {
                 formatter.write_str("invalid producer event sequence")
             }
+            Self::InvalidProducerAttempt => formatter.write_str("invalid producer attempt"),
             Self::InvalidRetentionClass => formatter.write_str("invalid retention class"),
         }
     }
@@ -255,6 +313,39 @@ mod tests {
         assert_eq!(
             value.validate(),
             Err(ArtifactRecordValidationError::SchemaIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn run_ingress_is_protocol_bound_and_coordinator_attempt_zero_only() {
+        let mut ingress = RunIngressArtifactRecord {
+            protocol: BASE_PROTOCOL.to_string(),
+            artifact_id: ArtifactId::parse(format!("art_{A}")).unwrap(),
+            artifact_type: "implementation-request/v1".to_string(),
+            schema_id: "implementation-request".to_string(),
+            schema_version: 1,
+            sha256: Sha256Digest::of_bytes(b"input"),
+            size: 5,
+            media_type: "application/json".to_string(),
+            run_id: RunId::parse(format!("flow_{A}")).unwrap(),
+            producer_attempt: 0,
+            producer_event_sequence: 1,
+            pipeline_definition_digest: Sha256Digest::of_bytes(b"pipeline"),
+            root_stage_instance_id: StageInstanceId::parse(format!("stage_{B}")).unwrap(),
+            component_digest: Sha256Digest::of_bytes(b"component"),
+            retention_class: "run-record".to_string(),
+        };
+        assert_eq!(ingress.validate(), Ok(()));
+        ingress.producer_attempt = 1;
+        assert_eq!(
+            ingress.validate(),
+            Err(ArtifactRecordValidationError::InvalidProducerAttempt)
+        );
+        ingress.producer_attempt = 0;
+        ingress.protocol = "herdr-flow/other".to_string();
+        assert_eq!(
+            ingress.validate(),
+            Err(ArtifactRecordValidationError::InvalidProtocol)
         );
     }
 

@@ -49,6 +49,20 @@ pub struct RunLeaseFence {
 }
 
 impl RunLeaseFence {
+    pub(crate) fn new(
+        run_id: RunId,
+        owner_id: OperationId,
+        lease_epoch: u64,
+        expires_at_unix_ms: u64,
+    ) -> Self {
+        Self {
+            run_id,
+            owner_id,
+            lease_epoch,
+            expires_at_unix_ms,
+        }
+    }
+
     pub fn run_id(&self) -> &RunId {
         &self.run_id
     }
@@ -70,7 +84,7 @@ pub struct LeasedRun<'store, 'clock> {
     pub(crate) store: &'store mut SqliteStore,
     pub(crate) clock: &'clock dyn UnixMillisClock,
     pub(crate) fence: RunLeaseFence,
-    duration_ms: u64,
+    pub(crate) duration_ms: u64,
 }
 
 impl SqliteStore {
@@ -163,6 +177,17 @@ impl SqliteStore {
 }
 
 impl LeasedRun<'_, '_> {
+    pub(crate) fn ensure_active(&mut self) -> Result<(), StoreError> {
+        let transaction = self
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let now = self.clock.now_unix_ms().map_err(StoreError::Clock)?;
+        require_active_fence(&transaction, &self.fence, now)?;
+        transaction.commit().map_err(StoreError::Sqlite)
+    }
+
     pub fn fence(&self) -> &RunLeaseFence {
         &self.fence
     }
